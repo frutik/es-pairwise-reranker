@@ -14,7 +14,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from reranker.cache import ComparisonCache
+from reranker.cache import open_cache
 from reranker.config import Settings
 from reranker.jev import JevClient
 from reranker.service import Reranker, rubric
@@ -44,7 +44,10 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        async with httpx.AsyncClient(timeout=settings.request_timeout_seconds, transport=transport) as client:
+        async with (
+            httpx.AsyncClient(timeout=settings.request_timeout_seconds, transport=transport) as client,
+            open_cache(settings, rubric(settings)) as cache,
+        ):
             jev = JevClient(
                 client,
                 url=settings.jev_url,
@@ -54,7 +57,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 tie_band=settings.tie_band,
                 max_document_chars=settings.max_document_chars,
             )
-            app.state.reranker = Reranker(jev, ComparisonCache(settings.cache_size, rubric(settings)), settings)
+            app.state.reranker = Reranker(jev, cache, settings)
             yield
 
     app = FastAPI(title="Pairwise reranker", lifespan=lifespan)
@@ -68,7 +71,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
     @app.get("/health")
     async def health() -> dict:
-        return {"status": "ok", "model": settings.jev_model, "max_documents": settings.max_documents}
+        cache = "redis" if settings.redis_url else "memory"
+        return {"status": "ok", "model": settings.jev_model, "max_documents": settings.max_documents, "cache": cache}
 
     @app.post("/v1/rerank", response_model=RerankResponse, dependencies=[Depends(authorised)])
     async def rerank(request: RerankRequest) -> RerankResponse:

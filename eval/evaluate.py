@@ -18,7 +18,7 @@ import sys
 
 import httpx
 
-from reranker.cache import ComparisonCache
+from reranker.cache import open_cache
 from reranker.config import Settings
 from reranker.jev import JevClient
 from reranker.metrics import kendall_tau_b, ndcg, pairwise_accuracy
@@ -28,7 +28,10 @@ MEASURES = {"nDCG@10": ndcg, "tau-b": kendall_tau_b, "pairwise accuracy": pairwi
 
 
 async def evaluate(queries: list[dict], settings: Settings, out=sys.stdout) -> dict:
-    async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+    async with (
+        httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client,
+        open_cache(settings, rubric(settings)) as cache,
+    ):
         jev = JevClient(
             client,
             url=settings.jev_url,
@@ -38,9 +41,7 @@ async def evaluate(queries: list[dict], settings: Settings, out=sys.stdout) -> d
             tie_band=settings.tie_band,
             max_document_chars=settings.max_document_chars,
         )
-        return await evaluate_with(
-            Reranker(jev, ComparisonCache(settings.cache_size, rubric(settings)), settings), queries, out
-        )
+        return await evaluate_with(Reranker(jev, cache, settings), queries, out)
 
 
 async def evaluate_with(reranker: Reranker, queries: list[dict], out=sys.stdout) -> dict:

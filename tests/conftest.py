@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from reranker.cache import ComparisonCache
+from reranker.cache import MemoryCache
 from reranker.config import Settings
 from reranker.jev import JevClient
 from reranker.service import Reranker, rubric
@@ -70,7 +70,7 @@ async def make_reranker(settings):
             tie_band=settings.tie_band,
             max_document_chars=settings.max_document_chars,
         )
-        return Reranker(jev, ComparisonCache(settings.cache_size, rubric(settings)), settings)
+        return Reranker(jev, MemoryCache(settings.cache_size, rubric(settings)), settings)
 
     yield make
     for client in clients:

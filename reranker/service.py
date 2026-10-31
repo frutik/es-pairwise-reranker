@@ -70,12 +70,13 @@ class Reranker:
     async def _rank(self, query: str, window: list[str]) -> Outcome:
         answers: dict[tuple[int, int], Winner] = {}
         missing: list[tuple[int, int]] = []
-        for i, j in pairs(len(window)):
-            cached = self._cache.get(query, window[i], window[j])
-            if cached is None:
+        every_pair = pairs(len(window))
+        cached = await self._cache.get_many(query, [(window[i], window[j]) for i, j in every_pair])
+        for (i, j), winner in zip(every_pair, cached, strict=True):
+            if winner is None:
                 missing.append((i, j))
             else:
-                answers[(i, j)] = cached
+                answers[(i, j)] = winner
 
         limit = asyncio.Semaphore(self._settings.concurrency)
 
@@ -84,7 +85,7 @@ class Reranker:
                 swap = swapped(query, window[i], window[j], self._rubric)
                 comparison = await self._jev.compare(query, window[i], window[j], swapped=swap)
             answers[(i, j)] = comparison.winner
-            self._cache.put(query, window[i], window[j], comparison.winner)
+            await self._cache.put(query, window[i], window[j], comparison.winner)
 
         failures = [
             result

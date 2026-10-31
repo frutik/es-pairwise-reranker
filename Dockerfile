@@ -7,5 +7,5 @@ COPY eval ./eval
 RUN pip install --no-cache-dir .
 
 EXPOSE 8000
-# One worker per container: the comparison cache is per process.
+# Workers come from WEB_CONCURRENCY (default 1). Without RERANKER_REDIS_URL each worker keeps its own cache.
 CMD ["uvicorn", "reranker.app:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,96 @@
+# The whole stack for local development: Elasticsearch, the reranker (two workers sharing one Redis cache) and Redis.
+# `setup` registers the pairwise-jev inference endpoint once Elasticsearch and the reranker are up.
+#
+#   cp .env.example .env    # set RERANKER_JEV_API_KEY (without it every rerank falls back to the search's order)
+#   docker compose up -d --build
+#   curl -s localhost:9200/_inference/rerank/pairwise-jev
+#
+# Local only: Elasticsearch security is off and every port binds to 127.0.0.1. Host ports: ES_PORT (9200),
+# RERANKER_PORT (8000), REDIS_PORT (6379).
+name: es-pairwise-reranker
+
+x-service-key: &service-key ${RERANKER_SERVICE_API_KEY:-local-dev-key}
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ES_VERSION:-9.5.5}
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      # The trial licence turns on every inference/retriever feature; it lasts 30 days per data volume.
+      xpack.license.self_generated.type: trial
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+    ports:
+      - "127.0.0.1:${ES_PORT:-9200}:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  redis:
+    image: redis:8.8-alpine
+    # A bounded LRU, like the in-memory cache; append-only so comparisons survive a restart.
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  reranker:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      RERANKER_SERVICE_API_KEY: *service-key
+      RERANKER_REDIS_URL: redis://redis:6379/0
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+    ports:
+      - "127.0.0.1:${RERANKER_PORT:-8000}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  setup:
+    image: curlimages/curl:latest
+    entrypoint: ["sh", "/setup.sh"]
+    environment:
+      RERANKER_SERVICE_API_KEY: *service-key
+    volumes:
+      - ./elasticsearch/setup.sh:/setup.sh:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      reranker:
+        condition: service_healthy
+    restart: "no"
+
+  # Optional: downloads Wayfair's WANDS products from GitHub (once, into a volume) and indexes them as `wands`.
+  #   docker compose --profile wands run --rm wands
+  wands:
+    build: .
+    profiles: [wands]
+    command: ["wands-load", "--es", "http://elasticsearch:9200", "--data-dir", "/data/wands"]
+    volumes:
+      - wands-data:/data
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+volumes:
+  es-data:
+  redis-data:
+  wands-data:

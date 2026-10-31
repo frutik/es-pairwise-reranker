@@ -33,8 +33,13 @@ class Settings(BaseSettings):
     request_timeout_seconds: float = 10.0
     time_budget_seconds: float = 8.0
 
-    # Comparisons kept in memory, so a pair is paid for once.
+    # Comparisons kept, so a pair is paid for once. Without a Redis URL, in this process's memory (cache_size entries);
+    # with one, in Redis, shared by every worker and replica (Redis's maxmemory policy evicts, cache_ttl_seconds
+    # expires, 0 never). A Redis call that takes longer than redis_timeout_seconds counts as a miss.
     cache_size: int = 100_000
+    redis_url: str = ""
+    cache_ttl_seconds: int = 0
+    redis_timeout_seconds: float = 0.5
 
     # When set, callers must send "Authorization: Bearer <this>" (Elasticsearch's inference endpoint can).
     service_api_key: str = ""

@@ -53,4 +53,9 @@ def test_refuses_a_request_without_the_fields_it_needs(client):
 
 
 def test_says_it_is_up(client):
-    assert client.get("/health").json() == {"status": "ok", "model": "jev-latest", "max_documents": 20}
+    assert client.get("/health").json() == {
+        "status": "ok",
+        "model": "jev-latest",
+        "max_documents": 20,
+        "cache": "memory",
+    }

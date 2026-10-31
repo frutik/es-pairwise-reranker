@@ -17,6 +17,29 @@ is easier, for models as for people. An order built from enough of those answers
 by grading each document. An order is not a set of grades, though: it says A beats B, not whether either is any good.
 So this service only reorders. Its scores are for sorting one query's hits, not for comparing across queries.
 
+## What to try next
+
+Comparing every pair is the most expensive way to get an order from pairwise answers: `n(n-1)/2` comparisons, so
+190 for 20 hits. It is what the experiments measured, so it is what the service does. These are the ways to make it
+cheaper or better, roughly in order of promise. Each one has to be measured against the current version (see
+[Evaluating](#evaluating)) before it replaces it.
+
+- **BlitzRank** ([Agrawal, Nguyen and Kiela, ICML 2026](https://arxiv.org/abs/2602.05448);
+  [code](https://github.com/ContextualAI/BlitzRank), `pip install blitzrank`). It asks the judge to order a small
+  set of `k` documents at once, which gives every pairwise preference within that set in one call. It collects these
+  into one tournament graph and uses transitivity (A beats B, B beats C, so A beats C) to infer orderings it never
+  asked about. The paper reports quality close to full pairwise ranking with about 7× fewer tokens, across 14
+  benchmarks and 5 models. Two open questions here: Jev would have to answer a `k`-way question instead of an A/B
+  one, and the swap against position bias would need a counterpart for orderings of `k` documents.
+- **Comparison sort**: a sort that uses the judge as its comparator needs about `n log n` comparisons, not `n²/2`.
+  Quepid has one to port (`app/services/pair_ranking/comparison_sort.rb`). Round-robin copes with a judge that
+  contradicts itself (82 cycles in 991 comparisons in the experiments); a sort does not, so check how much accuracy
+  that costs.
+- **Batching**: send a query's pairs to Jev as several questions in one request, with the documents in the state
+  once. This leaves the method unchanged and cuts requests and latency.
+- **Richer documents**: rerank on a combined field (title, brand, description) rather than the title alone. The
+  experiments showed Jev whole records with named fields.
+
 ## Evidence so far
 
 This is the method from experiments run in [Quepid](https://github.com/o19s/quepid) (a relevance-testing tool) on
@@ -72,6 +95,46 @@ cp .env.example .env   # set RERANKER_JEV_API_KEY, and RERANKER_SERVICE_API_KEY
 ```
 
 Or with Docker: `docker build -t es-pairwise-reranker . && docker run --env-file .env -p 8000:8000 es-pairwise-reranker`.
+
+**The whole stack** (Elasticsearch 9.5, the reranker with two workers, Redis as their shared cache) runs with Docker
+Compose. A one-off `setup` container registers the `pairwise-jev` inference endpoint once Elasticsearch and the
+reranker are healthy:
+
+```sh
+cp .env.example .env            # set RERANKER_JEV_API_KEY; without it every rerank falls back to the search's order
+docker compose up -d --build
+curl -s localhost:9200/_inference/rerank/pairwise-jev
+```
+
+It is for local use only: Elasticsearch security is off (on a 30-day trial licence) and the ports bind to 127.0.0.1.
+If the default ports are taken, change them with `ES_PORT`, `RERANKER_PORT` and `REDIS_PORT`, e.g.
+`ES_PORT=9201 docker compose up -d`. `WEB_CONCURRENCY` sets the number of reranker workers.
+
+**Trying it on WANDS.** [WANDS](https://github.com/wayfair/WANDS) is Wayfair's public furniture search dataset
+(42,994 products, MIT licence). To load it into the stack's Elasticsearch as the index `wands`:
+
+```sh
+docker compose --profile wands run --rm wands     # downloads it from GitHub the first time, then indexes it
+# or, without Docker for the loader: .venv/bin/wands-load --es http://localhost:9200   (files go to data/wands/)
+```
+
+Re-running replaces the index. The files are downloaded once: into the `wands-data` volume, or `--data-dir` on the
+host. Each product keeps WANDS' fields and adds `rerank_text`, which holds the name, category path, product class and
+the first 1,000 characters of the description. Point the reranker at that field, since Elasticsearch sends the judge
+only one field:
+
+```sh
+curl -s localhost:9200/wands/_search -H 'Content-Type: application/json' -d '{
+  "retriever": {"text_similarity_reranker": {
+    "retriever": {"standard": {"query": {"multi_match": {"query": "salon chair",
+      "fields": ["product_name^3", "product_class", "category_hierarchy", "product_description"]}}}},
+    "field": "rerank_text", "inference_id": "pairwise-jev", "inference_text": "salon chair", "rank_window_size": 10}}}'
+```
+
+**Cache.** Without `RERANKER_REDIS_URL` each process keeps its own in-memory cache. With it, every worker and replica
+shares one cache in Redis (run Redis with a `maxmemory` policy such as `allkeys-lru`). If Redis is down or slower
+than `RERANKER_REDIS_TIMEOUT_SECONDS`, its answers count as cache misses: the comparisons are asked again, and search
+keeps working.
 
 ```sh
 curl -s localhost:8000/v1/rerank -H 'Authorization: Bearer <service key>' -H 'Content-Type: application/json' \
@@ -146,10 +209,14 @@ one without, and compare them on a rated case. Elasticsearch does the reranking,
 
 - **Batching.** Jev can answer several questions in one request with the documents sent once, which would cut
   requests and latency a lot. It was not measured in the experiments, so it is not used yet.
-- **A shared cache.** The cache is per process; several workers or replicas each keep their own.
-- **Cheaper rankers.** Comparison sort (about n log n comparisons) or BlitzRank, for windows larger than about 20.
-- **Checked against a live cluster.** The inference endpoint follows Elasticsearch's documentation for the `custom`
-  service; it has not yet been run against a real 8.19+/9.1+ cluster.
+- **Cheaper rankers.** BlitzRank or comparison sort, for windows larger than about 20; see
+  [What to try next](#what-to-try-next).
+- **The order Elasticsearch sends hits in.** Checked against Elasticsearch 9.5.5 (the compose stack): the endpoint is
+  accepted and its order is applied. Elasticsearch shifts the returned scores (+1, and negative scores into (0, 1)),
+  but keeps their order. However, it sends the top `rank_window_size` hits in **index order, not score order**. The
+  service assumes the search's order in three places: the fallback order, the tiebreak between equal win counts, and
+  which hits fall inside `max_documents`. Until that is fixed, keep `rank_window_size` ≤ `max_documents`, and expect
+  the fallback to return index order.
 
 ## Development
 
