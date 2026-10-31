@@ -1,0 +1,15 @@
+{
+  "retriever": {
+    "text_similarity_reranker": {
+      "retriever": {
+        "standard": {
+          "query": { "match": { "title": "angle bracket" } }
+        }
+      },
+      "field": "title",
+      "inference_id": "pairwise-jev",
+      "inference_text": "angle bracket",
+      "rank_window_size": 10
+    }
+  }
+}

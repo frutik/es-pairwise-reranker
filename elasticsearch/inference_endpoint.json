@@ -1,0 +1,20 @@
+{
+  "service": "custom",
+  "service_settings": {
+    "secret_parameters": {
+      "api_key": "<RERANKER_SERVICE_API_KEY>"
+    },
+    "url": "http://localhost:8000/v1/rerank",
+    "headers": {
+      "Authorization": "Bearer ${api_key}",
+      "Content-Type": "application/json"
+    },
+    "request": "{\"query\": ${query}, \"documents\": ${input}}",
+    "response": {
+      "json_parser": {
+        "relevance_score": "$.results[*].relevance_score",
+        "reranked_index": "$.results[*].index"
+      }
+    }
+  }
+}
