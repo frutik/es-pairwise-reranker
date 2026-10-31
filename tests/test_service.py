@@ -3,6 +3,7 @@ import asyncio
 import httpx
 
 from reranker.config import Settings
+from reranker.service import rubric
 from tests.conftest import FakeJev, grade
 
 DOCUMENTS = ["chair #1", "angle bracket #3", "shelf bracket #2", "lamp #0"]
@@ -44,15 +45,15 @@ async def test_asks_about_a_pair_once_and_answers_the_same_query_again_from_the_
     ]
 
 
-async def test_reranks_only_the_first_max_documents_and_keeps_the_rest_below_in_the_search_order(
-    make_reranker, fake_jev
-):
+async def test_reranks_only_the_first_max_documents_and_puts_the_rest_below_with_equal_scores(make_reranker, fake_jev):
     settings = Settings(_env_file=None, jev_api_key="k", max_documents=3)
     outcome = await make_reranker(fake_jev, settings).rerank("q", ["a #0", "b #2", "c #1", "d #9", "e #8"])
 
     assert [ranked.index for ranked in outcome.results] == [1, 2, 0, 3, 4]
     assert len(fake_jev.requests) == 3
-    assert outcome.results[2].score > outcome.results[3].score > outcome.results[4].score
+    # Equal, so the caller's own order (in Elasticsearch, the original query's) decides between them.
+    assert outcome.results[2].score > outcome.results[3].score == outcome.results[4].score
+    assert outcome.beyond_window == 2
 
 
 async def test_returns_only_top_n(make_reranker, fake_jev):
@@ -61,7 +62,7 @@ async def test_returns_only_top_n(make_reranker, fake_jev):
     assert [ranked.index for ranked in outcome.results] == [1, 2]
 
 
-async def test_equal_wins_keep_the_search_order_once_sorted_by_score(make_reranker):
+async def test_equal_wins_are_exactly_equal_scores_listed_in_input_order(make_reranker):
     def always_a_tie(request):
         return httpx.Response(200, json={"answers": {"preference": {"choice": "A", "probabilities": {"A": 0.5}}}})
 
@@ -69,7 +70,7 @@ async def test_equal_wins_keep_the_search_order_once_sorted_by_score(make_rerank
     outcome = await make_reranker(always_a_tie, settings).rerank("q", ["x", "y", "z"])
 
     assert [ranked.index for ranked in outcome.results] == [0, 1, 2]
-    assert outcome.results[0].score > outcome.results[1].score > outcome.results[2].score
+    assert outcome.results[0].score == outcome.results[1].score == outcome.results[2].score
 
 
 async def test_falls_back_to_the_search_order_when_jev_fails(make_reranker):
@@ -77,6 +78,8 @@ async def test_falls_back_to_the_search_order_when_jev_fails(make_reranker):
 
     assert not outcome.reranked
     assert [ranked.index for ranked in outcome.results] == [0, 1, 2, 3]
+    # No opinion: every hit the same score, so Elasticsearch keeps the original query's order (see search_example).
+    assert len({ranked.score for ranked in outcome.results}) == 1
     assert "Jev answered 503" in outcome.reason
 
 
@@ -99,3 +102,9 @@ async def test_no_documents_or_one_needs_no_judge(make_reranker, fake_jev):
     assert (await reranker.rerank("q", [])).results == []
     assert [ranked.index for ranked in (await reranker.rerank("q", ["only #1"])).results] == [0]
     assert fake_jev.requests == []
+
+
+def test_another_judge_url_is_another_rubric():
+    real = Settings(_env_file=None)
+    assert rubric(real) != rubric(Settings(_env_file=None, jev_url="http://fake-jev:9000"))
+    assert rubric(real) == rubric(Settings(_env_file=None))

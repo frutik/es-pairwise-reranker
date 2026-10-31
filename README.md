@@ -81,20 +81,33 @@ Other findings from the experiments that shaped this service:
 2. The first `max_documents` (default 20) are compared in every pair: `n(n-1)/2` comparisons, 45 for 10 hits and 190
    for 20. Each comparison is one Jev request, as in the experiments, sent in parallel (`concurrency`).
 3. Answers are cached in memory per model, instructions, query and pair, so a repeated query costs nothing.
-4. Each hit's score is the share of the others it beat. Equal scores keep the search's order. Hits past
-   `max_documents` keep their order, below the reranked ones.
-5. **Fail open:** if Jev errors or the `time_budget_seconds` runs out, the search's own order is returned, so a slow
-   or failing judge never breaks search. The response's `meta.reranked` says which happened.
+4. Each hit's score is the share of the others it beat. Hits past `max_documents` all get one score, below the
+   reranked ones (`meta.beyond_window` counts them).
+5. **Fail open:** if Jev errors or the `time_budget_seconds` runs out, every hit gets the same score, so a slow or
+   failing judge never breaks search. The response's `meta.reranked` says which happened.
+6. **Equal scores mean "no opinion"**, and the caller breaks them with the search's order. That order cannot be
+   decided here: Elasticsearch sends the hits in index order, not score order, and without their scores. In
+   Elasticsearch that is what the `linear` retriever in the [example search](#wiring-it-into-elasticsearch) does. The
+   results list itself is sorted by score and then by input position, which is right for callers that send hits in
+   the search's order (`rerank-eval`).
 
 ## Running it
 
 ```sh
-python3.13 -m venv .venv && .venv/bin/pip install -e '.[dev]'
+python3.13 -m venv .venv   # 3.12+ && .venv/bin/pip install -e '.[dev]'
 cp .env.example .env   # set RERANKER_JEV_API_KEY, and RERANKER_SERVICE_API_KEY
 .venv/bin/uvicorn reranker.app:app --port 8000
 ```
 
 Or with Docker: `docker build -t es-pairwise-reranker . && docker run --env-file .env -p 8000:8000 es-pairwise-reranker`.
+
+```sh
+curl -s localhost:8000/v1/rerank -H 'Authorization: Bearer <service key>' -H 'Content-Type: application/json' \
+  -d '{"query": "angle bracket", "documents": ["Patio chair", "Simpson Strong-Tie 12-Gauge Angle", "Shelf bracket"]}'
+# {"results": [{"index": 1, "relevance_score": 1.0}, ...], "meta": {"reranked": true, "comparisons": 3, ...}}
+```
+
+All settings are environment variables, listed with their defaults in `.env.example` and `reranker/config.py`.
 
 **The whole stack** (Elasticsearch 9.5, the reranker with two workers, Redis as their shared cache) runs with Docker
 Compose. A one-off `setup` container registers the `pairwise-jev` inference endpoint once Elasticsearch and the
@@ -103,8 +116,21 @@ reranker are healthy:
 ```sh
 cp .env.example .env            # set RERANKER_JEV_API_KEY; without it every rerank falls back to the search's order
 docker compose up -d --build
+docker compose wait setup       # `up -d` returns before the endpoint is registered; this waits for it (exit code 0)
 curl -s localhost:9200/_inference/rerank/pairwise-jev
 ```
+
+**Without a Jev key**, or to avoid paying for comparisons, run the stack against a fake Jev
+([`fake_jev/server.py`](fake_jev/server.py)). It prefers the document that shares more words with the query, so it
+checks the wiring, the cache, timeouts and fail-open; it says nothing about relevance quality.
+
+```sh
+RERANKER_JEV_URL=http://fake-jev:9000 docker compose --profile fake-jev up -d --build
+FAKE_JEV_FAIL=1 RERANKER_JEV_URL=http://fake-jev:9000 docker compose --profile fake-jev up -d   # every Jev call 503s
+FAKE_JEV_DELAY_SECONDS=10 ...                                                                  # every Jev call is slow
+```
+
+The judge's URL is part of the cache key, so the fake's answers never stand in for real Jev's in Redis.
 
 It is for local use only: Elasticsearch security is off (on a 30-day trial licence) and the ports bind to 127.0.0.1.
 If the default ports are taken, change them with `ES_PORT`, `RERANKER_PORT` and `REDIS_PORT`, e.g.
@@ -124,25 +150,20 @@ the first 1,000 characters of the description. Point the reranker at that field,
 only one field:
 
 ```sh
+Q='{"multi_match": {"query": "salon chair",
+     "fields": ["product_name^3", "product_class", "category_hierarchy", "product_description"]}}'
 curl -s localhost:9200/wands/_search -H 'Content-Type: application/json' -d '{
-  "retriever": {"text_similarity_reranker": {
-    "retriever": {"standard": {"query": {"multi_match": {"query": "salon chair",
-      "fields": ["product_name^3", "product_class", "category_hierarchy", "product_description"]}}}},
-    "field": "rerank_text", "inference_id": "pairwise-jev", "inference_text": "salon chair", "rank_window_size": 10}}}'
+  "retriever": {"linear": {"rank_window_size": 10, "retrievers": [
+    {"retriever": {"text_similarity_reranker": {"retriever": {"standard": {"query": '"$Q"'}},
+       "field": "rerank_text", "inference_id": "pairwise-jev", "inference_text": "salon chair",
+       "rank_window_size": 10}}, "weight": 1},
+    {"retriever": {"standard": {"query": '"$Q"'}}, "weight": 0.001, "normalizer": "minmax"}]}}}'
 ```
 
 **Cache.** Without `RERANKER_REDIS_URL` each process keeps its own in-memory cache. With it, every worker and replica
 shares one cache in Redis (run Redis with a `maxmemory` policy such as `allkeys-lru`). If Redis is down or slower
 than `RERANKER_REDIS_TIMEOUT_SECONDS`, its answers count as cache misses: the comparisons are asked again, and search
 keeps working.
-
-```sh
-curl -s localhost:8000/v1/rerank -H 'Authorization: Bearer <service key>' -H 'Content-Type: application/json' \
-  -d '{"query": "angle bracket", "documents": ["Patio chair", "Simpson Strong-Tie 12-Gauge Angle", "Shelf bracket"]}'
-# {"results": [{"index": 1, "relevance_score": 1.0}, ...], "meta": {"reranked": true, "comparisons": 3, ...}}
-```
-
-All settings are environment variables, listed with their defaults in `.env.example` and `reranker/config.py`.
 
 ## Wiring it into Elasticsearch
 
@@ -162,22 +183,48 @@ Then rerank in a search ([`elasticsearch/search_example.json`](elasticsearch/sea
 ```json
 {
   "retriever": {
-    "text_similarity_reranker": {
-      "retriever": { "standard": { "query": { "match": { "title": "angle bracket" } } } },
-      "field": "title",
-      "inference_id": "pairwise-jev",
-      "inference_text": "angle bracket",
-      "rank_window_size": 10
+    "linear": {
+      "rank_window_size": 10,
+      "retrievers": [
+        {
+          "retriever": {
+            "text_similarity_reranker": {
+              "retriever": { "standard": { "query": { "match": { "title": "angle bracket" } } } },
+              "field": "title",
+              "inference_id": "pairwise-jev",
+              "inference_text": "angle bracket",
+              "rank_window_size": 10
+            }
+          },
+          "weight": 1
+        },
+        {
+          "retriever": { "standard": { "query": { "match": { "title": "angle bracket" } } } },
+          "weight": 0.001,
+          "normalizer": "minmax"
+        }
+      ]
     }
   }
 }
 ```
 
+**Why `linear` around the reranker.** Elasticsearch sends the reranker the top hits in index order, without their
+scores, and orders equal rerank scores by index too. A plain `text_similarity_reranker` therefore shows ties, and the
+whole fallback, in index order. Adding the original query again with a tiny weight breaks those ties by its own
+score, so a tie or a fallback comes back in the search's order. 0.001 has to stay below the smallest gap between
+rerank scores, half a win out of `n - 1` (0.026 for 20 hits). The query runs twice; that costs much less than the
+comparisons.
+
 Things to know:
 
 - **Only `field` is sent.** The judge sees that one field's text. If titles alone are not enough, index a combined
   field (title, brand, description) and rerank on that.
-- **`rank_window_size` is the cost.** 10 hits are 45 comparisons; keep it at or below `max_documents`.
+- **`rank_window_size` is the cost.** 10 hits are 45 comparisons. Keep it at or below `max_documents`. Beyond that,
+  the hits that get reranked are the first in index order, not the best (the response's `meta.beyond_window` and
+  a warning in the log say so).
+- **A failing endpoint fails the search.** If the reranker answers with an error, Elasticsearch fails the whole
+  search (400). That is why the service always answers 200 and falls back with equal scores instead.
 - **Timeouts.** Keep the service's `time_budget_seconds` below Elasticsearch's inference timeout, so a slow judge
   falls back to the search's order instead of failing the search.
 
@@ -211,12 +258,9 @@ one without, and compare them on a rated case. Elasticsearch does the reranking,
   requests and latency a lot. It was not measured in the experiments, so it is not used yet.
 - **Cheaper rankers.** BlitzRank or comparison sort, for windows larger than about 20; see
   [What to try next](#what-to-try-next).
-- **The order Elasticsearch sends hits in.** Checked against Elasticsearch 9.5.5 (the compose stack): the endpoint is
-  accepted and its order is applied. Elasticsearch shifts the returned scores (+1, and negative scores into (0, 1)),
-  but keeps their order. However, it sends the top `rank_window_size` hits in **index order, not score order**. The
-  service assumes the search's order in three places: the fallback order, the tiebreak between equal win counts, and
-  which hits fall inside `max_documents`. Until that is fixed, keep `rank_window_size` ≤ `max_documents`, and expect
-  the fallback to return index order.
+- **Checked on one Elasticsearch version only**: 9.5.5, the compose stack. The endpoint is accepted, the reranked
+  order is applied, and the `linear` retriever breaks ties and the fallback in BM25 order. Elasticsearch shifts the
+  returned scores (+1, and negative ones into (0, 1)) but keeps their order. 8.19 has not been tried.
 
 ## Development
 

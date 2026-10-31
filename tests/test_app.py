@@ -26,7 +26,14 @@ def test_answers_in_the_shape_the_elasticsearch_endpoint_reads(client):
     body = response.json()
     assert [result["index"] for result in body["results"]] == [1, 2, 0]
     assert [round(result["relevance_score"], 3) for result in body["results"]] == [1.0, 0.5, 0.0]
-    assert body["meta"] == {"reranked": True, "comparisons": 3, "asked": 3, "cycles": 0, "reason": None}
+    assert body["meta"] == {
+        "reranked": True,
+        "comparisons": 3,
+        "asked": 3,
+        "cycles": 0,
+        "reason": None,
+        "beyond_window": 0,
+    }
     assert all(result["document"] is None for result in body["results"])
 
 

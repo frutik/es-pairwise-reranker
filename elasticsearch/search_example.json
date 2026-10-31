@@ -1,15 +1,34 @@
 {
   "retriever": {
-    "text_similarity_reranker": {
-      "retriever": {
-        "standard": {
-          "query": { "match": { "title": "angle bracket" } }
+    "linear": {
+      "rank_window_size": 10,
+      "retrievers": [
+        {
+          "retriever": {
+            "text_similarity_reranker": {
+              "retriever": {
+                "standard": {
+                  "query": { "match": { "title": "angle bracket" } }
+                }
+              },
+              "field": "title",
+              "inference_id": "pairwise-jev",
+              "inference_text": "angle bracket",
+              "rank_window_size": 10
+            }
+          },
+          "weight": 1
+        },
+        {
+          "retriever": {
+            "standard": {
+              "query": { "match": { "title": "angle bracket" } }
+            }
+          },
+          "weight": 0.001,
+          "normalizer": "minmax"
         }
-      },
-      "field": "title",
-      "inference_id": "pairwise-jev",
-      "inference_text": "angle bracket",
-      "rank_window_size": 10
+      ]
     }
   }
 }

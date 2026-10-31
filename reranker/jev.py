@@ -69,7 +69,8 @@ class JevClient:
             response = await self._client.post(
                 self._url,
                 json=self.request_body(query, first, second, swapped=swapped),
-                headers={"Authorization": f"Bearer {self._api_key}"},
+                # No key, no header: Jev answers 401, which says more than a malformed "Bearer ".
+                headers={"Authorization": f"Bearer {self._api_key}"} if self._api_key else {},
             )
         except httpx.HTTPError as error:
             raise JevError(f"could not reach Jev: {error}") from error

@@ -3,6 +3,9 @@
 #
 #   cp .env.example .env    # set RERANKER_JEV_API_KEY (without it every rerank falls back to the search's order)
 #   docker compose up -d --build
+#
+# Without a key, or to not pay for comparisons, run a fake Jev (word overlap, see fake_jev/server.py) instead:
+#   RERANKER_JEV_URL=http://fake-jev:9000 docker compose --profile fake-jev up -d --build
 #   curl -s localhost:9200/_inference/rerank/pairwise-jev
 #
 # Local only: Elasticsearch security is off and every port binds to 127.0.0.1. Host ports: ES_PORT (9200),
@@ -52,15 +55,36 @@ services:
     environment:
       RERANKER_SERVICE_API_KEY: *service-key
       RERANKER_REDIS_URL: redis://redis:6379/0
+      RERANKER_JEV_URL: ${RERANKER_JEV_URL:-https://api.typesafe.ai/v1/systemone}
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
     ports:
       - "127.0.0.1:${RERANKER_PORT:-8000}:8000"
     depends_on:
       redis:
         condition: service_healthy
+      fake-jev:
+        condition: service_healthy
+        required: false  # only when the fake-jev profile is on
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Optional: a stand-in for Jev (word overlap), with --profile fake-jev and RERANKER_JEV_URL=http://fake-jev:9000.
+  # FAKE_JEV_DELAY_SECONDS slows every answer (try the time budget); FAKE_JEV_FAIL=1 fails them (try fail-open).
+  fake-jev:
+    image: python:3.13-slim
+    profiles: [fake-jev]
+    command: ["python", "-u", "/fake_jev/server.py"]
+    environment:
+      FAKE_JEV_DELAY_SECONDS: ${FAKE_JEV_DELAY_SECONDS:-0}
+      FAKE_JEV_FAIL: ${FAKE_JEV_FAIL:-0}
+    volumes:
+      - ./fake_jev:/fake_jev:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/')"]
+      interval: 3s
       timeout: 3s
       retries: 10
 

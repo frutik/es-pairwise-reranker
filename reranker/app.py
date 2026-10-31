@@ -91,6 +91,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             "asked": outcome.asked,
             "cycles": outcome.cycles,
             "reason": outcome.reason,
+            "beyond_window": outcome.beyond_window,
         }
         return RerankResponse(results=results, meta=meta)
 
