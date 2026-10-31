@@ -57,6 +57,10 @@ services:
       RERANKER_REDIS_URL: redis://redis:6379/0
       RERANKER_JEV_URL: ${RERANKER_JEV_URL:-https://api.typesafe.ai/v1/systemone}
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      # Passed through so a run can change them without editing .env (defaults as in reranker/config.py).
+      RERANKER_MAX_DOCUMENTS: ${RERANKER_MAX_DOCUMENTS:-20}
+      RERANKER_CONCURRENCY: ${RERANKER_CONCURRENCY:-16}
+      RERANKER_TIME_BUDGET_SECONDS: ${RERANKER_TIME_BUDGET_SECONDS:-8}
     ports:
       - "127.0.0.1:${RERANKER_PORT:-8000}:8000"
     depends_on:

@@ -24,6 +24,7 @@ dev = [
 rerank-eval = "eval.evaluate:main"
 wands-load = "eval.wands:main"
 wands-judged = "eval.wands:main_judged"
+es-eval = "eval.es_eval:main"
 
 [build-system]
 requires = ["setuptools>=69"]

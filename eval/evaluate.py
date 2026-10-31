@@ -33,6 +33,16 @@ from reranker.service import Reranker, rubric
 MEASURES = {"nDCG@10": ndcg, "tau-b": kendall_tau_b, "pairwise accuracy": pairwise_accuracy}
 
 
+def measures_at(depth: int) -> dict:
+    """The measures on the first `depth` hits of an order of more candidates: nDCG@depth against the ideal order of all
+    of them (so bringing a better hit up from below counts), tau-b and pairwise accuracy among the hits shown."""
+    return {
+        f"nDCG@{depth}": lambda grades: ndcg(grades, depth),
+        f"tau-b@{depth}": lambda grades: kendall_tau_b(grades[:depth]),
+        f"pairwise acc.@{depth}": lambda grades: pairwise_accuracy(grades[:depth]),
+    }
+
+
 async def evaluate(queries: list[dict], settings: Settings, out=sys.stdout, per_query: bool = False) -> dict:
     async with (
         httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client,
@@ -75,8 +85,6 @@ async def evaluate_with(reranker: Reranker, queries: list[dict], out=sys.stdout,
                 file=out,
             )
 
-    summary = {arm: {name: _mean(values) for name, values in measures.items()} for arm, measures in scores.items()}
-    summary["difference"] = {name: _paired(scores["search"][name], scores["reranked"][name]) for name in MEASURES}
     print(
         f"{len(queries)} queries, {comparisons} comparisons asked, {fell_back} fell back to the search's order",
         file=out,
@@ -86,8 +94,17 @@ async def evaluate_with(reranker: Reranker, queries: list[dict], out=sys.stdout,
             f"Jev: {tokens} input tokens; per query {statistics.median(seconds):.1f}s median, {max(seconds):.1f}s max",
             file=out,
         )
+    return report(scores, out)
+
+
+def report(scores: dict, out=sys.stdout) -> dict:
+    """Prints the table of measures for scores = {"search": {measure: [per query]}, "reranked": {...}}, and returns
+    the means and the paired differences."""
+    summary = {arm: {name: _mean(values) for name, values in measures.items()} for arm, measures in scores.items()}
+    names = list(scores["search"])
+    summary["difference"] = {name: _paired(scores["search"][name], scores["reranked"][name]) for name in names}
     print(f"{'':20}{'search':>10}{'reranked':>10}{'diff':>9}  {'95% CI':^17}  better/same/worse", file=out)
-    for name in MEASURES:
+    for name in names:
         difference = summary["difference"][name]
         interval = f"[{difference['low']:+.3f}, {difference['high']:+.3f}]" if difference["low"] is not None else "n/a"
         print(

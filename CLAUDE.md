@@ -25,7 +25,12 @@ docker compose up -d --build                               # ES 9.5 + reranker (
 docker compose wait setup                                  # `up -d` returns before setup has registered it
 docker compose --profile wands run --rm wands              # download WANDS from GitHub + index it as `wands`
 RERANKER_JEV_URL=http://fake-jev:9000 docker compose --profile fake-jev up -d   # no key, no cost: fake Jev
+.venv/bin/wands-judged judged-wands-all.jsonl --es http://localhost:9201   # judged queries (add --sample 30)
+.venv/bin/es-eval judged-wands-all.jsonl --es http://localhost:9201       # quality + added delay through ES
 ```
+
+If the reranker container is recreated, Elasticsearch keeps calling its old IP ("Connection refused"). Restart
+Elasticsearch, then run `docker compose run --rm setup`.
 
 `.env` holds a real Jev key, which compose passes to the reranker. A search through the stack without the fake-jev
 profile calls real Jev and costs tokens.

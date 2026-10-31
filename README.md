@@ -62,8 +62,9 @@ two). Cost: 991 comparisons, about 670 tokens each.
 again (tau-b 0.421 against 0.354; nDCG@10 0.979 against 0.972) but within the noise. The search's own top 10 already
 scored 0.957, which left little to improve.
 
-So: **one clear win, one inconclusive result.** Measure it on your own data before trusting it with traffic (see
-[Evaluating](#evaluating)).
+So, in Quepid: **one clear win, one inconclusive result.** This service, run on all of WANDS' usable queries, then
+gave a clear win there too (see [Results](#results)). Measure it on your own data before trusting it with traffic
+(see [Evaluating](#evaluating)).
 
 Other findings from the experiments that shaped this service:
 
@@ -75,12 +76,130 @@ Other findings from the experiments that shaped this service:
   comparator, or BlitzRank) were not tested.
 - Model: `jev-latest` (1.14.0 at the time). The judging instructions are in `reranker/config.py`.
 
+## Results
+
+**Pairwise reranking clearly beats BM25 on WANDS.** Over all 222 usable queries it improves nDCG@10, tau-b and
+pairwise accuracy, with every 95% interval well above zero. It adds about 0.6 s to a new query and about 50 ms to a
+repeated one.
+
+This service, run through Elasticsearch on WANDS, measured on 2026-10-31.
+
+**Setup.**
+- **Stack:** the compose stack, Elasticsearch 9.5.5, with the reranker's default settings (8 s time budget, 16
+  comparisons in parallel, Redis cache). The judge is real Jev (`jev-latest`).
+- **Baseline:** BM25, a `multi_match` on product name (boosted 3×), product class, category path and description.
+- **Reranked:** the same search through the `linear` retriever of
+  [`search_example.json`](elasticsearch/search_example.json). The top 10 hits are reranked on `rerank_text`.
+- **Queries:** every WANDS query whose BM25 top 10 is fully labelled and not all graded the same, 222 of 480. The
+  others can't be scored (an unlabelled hit) or score the same in any order.
+- **Grades:** WANDS' labels, Exact 2, Partial 1, Irrelevant 0.
+
+**Agreement with the human labels** (95% paired bootstrap interval on the per-query difference):
+
+| Measure | BM25 | Pairwise | Difference | 95% interval | Queries better / same / worse |
+| --- | --- | --- | --- | --- | --- |
+| nDCG@10 | 0.903 | 0.951 | **+0.048** | +0.032 to +0.065 | 130 / 47 / 45 |
+| Kendall's tau-b | 0.168 | 0.396 | **+0.228** | +0.173 to +0.284 | 134 / 50 / 38 |
+| Pairwise accuracy | 0.648 | 0.822 | **+0.174** | +0.129 to +0.219 | 134 / 50 / 38 |
+
+Every interval is well above zero. A first run on a random 30 of these queries pointed the same way, but only tau-b
+cleared the noise (+0.151, interval +0.005 to +0.293), so 30 queries were too few for this dataset. Looking at the
+two worst queries of that run, the losses came mostly from doubtful labels. For "desk for kids", "kids desk" is
+labelled Exact and every other "<brand> kids desk" Irrelevant.
+
+**Search time, and the delay reranking adds** (per query, as the Elasticsearch client sees it):
+
+| | p50 | p90 | p95 | p99 | max |
+| --- | --- | --- | --- | --- | --- |
+| Plain BM25 search | 5 ms | 7 ms | 7 ms | 11 ms | 25 ms |
+| Reranked, cold cache | 618 ms | 687 ms | 705 ms | 822 ms | 960 ms |
+| Reranked, warm cache | 57 ms | 61 ms | 62 ms | 64 ms | 64 ms |
+| **Added**, cold cache | **+612 ms** | +683 ms | +698 ms | +817 ms | +949 ms |
+| **Added**, warm cache | **+53 ms** | +56 ms | +57 ms | +58 ms | +60 ms |
+
+"Cold" is the first time a query is asked, with all 45 comparisons new. "Warm" is the same search again, with every
+comparison in the cache. A changed result list falls in between: only its new pairs are asked (see
+[What is cached](#what-is-cached)). No query fell back to the search's order; the slowest stayed far inside the 8 s
+budget.
+
+**Cost:** 45 comparisons per new query, 9,990 in all. In-process, Jev reported about 625 input tokens per
+comparison. That is about 28,000 per new query and about 6.2 million for the run. (Through Elasticsearch the counts
+are not passed back, so these come from the in-process run.)
+
+**Limits.**
+- One dataset and one baseline query. A stronger first-stage search would leave less to gain.
+- WANDS' labels are noisy in places.
+- The 222 queries exclude those that could not be scored.
+- Pairwise has not yet been compared with pointwise Jev on this data. In Quepid's experiments, on other data,
+  pointwise came between the search and pairwise.
+
+### Catastrophy: Reranking a window of 30
+
+**Better results, at eight times the delay.** Reranking BM25's top 30 instead of its top 10 more than doubles the
+gain in nDCG@10, because good hits from below position 10 are brought up. But a new query waits about 4.9 s instead
+of 0.6 s, too long for a live search.
+
+The setup is the same as above, except:
+- **Window:** the reranker gets BM25's top **30** hits, and the measures are taken on the top **10** of each order.
+  nDCG@10 is measured against the ideal top 10 of all 30 graded hits, so pulling a good hit up from below position 10
+  counts. tau-b@10 and pairwise accuracy@10 score the order of the 10 hits shown.
+- **Queries:** the 204 whose top 30 are all labelled and not all graded the same.
+- **Settings:** `RERANKER_MAX_DOCUMENTS=30`, and a 60 s time budget so that no query would fall back. None needed
+  it: the slowest took 5.2 s, inside the default 8 s.
+
+**Agreement with the human labels:**
+
+| Measure (top 10) | BM25 | Pairwise | Difference | 95% interval | Queries better / same / worse |
+| --- | --- | --- | --- | --- | --- |
+| nDCG@10 | 0.808 | 0.921 | **+0.113** | +0.089 to +0.138 | 121 / 54 / 29 |
+| tau-b@10 | 0.173 | 0.323 | **+0.099** | +0.036 to +0.165 | 64 / 29 / 35 |
+| Pairwise accuracy@10 | 0.651 | 0.778 | **+0.089** | +0.036 to +0.144 | 64 / 31 / 33 |
+
+- **nDCG@10** gains +0.113, against +0.048 with a window of 10. BM25 starts lower here (0.808, not 0.903) because
+  the ideal is now the best 10 of 30, and reranking 30 recovers most of the gap.
+- **tau-b@10 and pairwise accuracy@10** only count queries whose top 10 is not all one grade. Many top 10s became all
+  one grade after reranking (66, against 36 for BM25), and those have no order left to score, so 128 queries count. So the
+  "Difference" column (per query, both defined) is not the difference of the two means.
+
+**Search time, and the delay reranking adds** (per query, as the Elasticsearch client sees it):
+
+| | p50 | p90 | p95 | p99 | max |
+| --- | --- | --- | --- | --- | --- |
+| Plain BM25 search (30 hits) | 6 ms | 8 ms | 9 ms | 11 ms | 30 ms |
+| Reranked, cold cache | 4,903 ms | 5,033 ms | 5,057 ms | 5,086 ms | 5,217 ms |
+| Reranked, warm cache | 57 ms | 61 ms | 62 ms | 66 ms | 79 ms |
+| **Added**, cold cache | **+4,898 ms** | +5,029 ms | +5,050 ms | +5,080 ms | +5,206 ms |
+| **Added**, warm cache | **+51 ms** | +55 ms | +56 ms | +60 ms | +72 ms |
+
+**Why so slow:** 30 hits are 435 comparisons per query, against 45. At 16 in parallel, that is about 27 rounds of Jev
+calls instead of 3, and the delay grows with them: 0.6 s to 4.9 s. A repeated query is as fast as before (+51 ms),
+because every comparison comes from the cache.
+
+**Cost:** 435 comparisons per new query, 88,740 in all. At about 625 input tokens per comparison (measured in-process
+on WANDS), that is about 272,000 tokens per new query, 10× the window of 10, and about 55 million for the run.
+
+**What it is good for as it is:** work that can wait, such as offline reranking, precomputing the most frequent
+queries, or warming the cache in advance. For live search, the number of rounds has to come down. One way is
+batching a group's pairs into one Jev request; another is a BlitzRank-style schedule that asks only what can change
+the top 10 (see [What to try next](#what-to-try-next)).
+
+To reproduce:
+
+```sh
+docker compose up -d --build && docker compose wait setup
+docker compose --profile wands run --rm wands
+.venv/bin/wands-judged judged-wands-all.jsonl
+docker compose exec redis redis-cli FLUSHDB
+.venv/bin/es-eval judged-wands-all.jsonl --per-query
+```
+
 ## How it works
 
 1. Elasticsearch sends the query and the text of the top `rank_window_size` hits.
 2. The first `max_documents` (default 20) are compared in every pair: `n(n-1)/2` comparisons, 45 for 10 hits and 190
    for 20. Each comparison is one Jev request, as in the experiments, sent in parallel (`concurrency`).
-3. Answers are cached in memory per model, instructions, query and pair, so a repeated query costs nothing.
+3. Each answer is cached per query and pair of texts, so a repeated query costs nothing and a changed result list
+   only pays for its new pairs ([What is cached](#what-is-cached)).
 4. Each hit's score is the share of the others it beat. Hits past `max_documents` all get one score, below the
    reranked ones (`meta.beyond_window` counts them).
 5. **Fail open:** if Jev errors or the `time_budget_seconds` runs out, every hit gets the same score, so a slow or
@@ -90,6 +209,49 @@ Other findings from the experiments that shaped this service:
    Elasticsearch that is what the `linear` retriever in the [example search](#wiring-it-into-elasticsearch) does. The
    results list itself is sorted by score and then by input position, which is right for callers that send hits in
    the search's order (`rerank-eval`).
+
+## What is cached
+
+One entry is **one comparison**: for a query and two document texts A and B, which of the two Jev preferred. The
+cache holds neither result lists nor scores.
+
+| | |
+| --- | --- |
+| **Key** | SHA-256 of: the judge (the rubric, below), the query text, and the two document texts in a fixed order (the smaller string first), so "A vs B" and "B vs A" are one entry. In Redis: `reranker:comparison:<hex>` |
+| **Value** | The winner, `first`, `second` or `tie`, relative to that fixed order. Read back the other way round, it is flipped. Jev's probability and confidence are not kept |
+| **Rubric** (the judge) | Jev URL, model name, judging instructions, tie band and the truncation length (`RERANKER_MAX_DOCUMENT_CHARS`). Change any of them and every comparison is asked again, because it is a different question |
+
+**Not in the key:** the hits' positions or BM25 scores, document ids, the other hits of the result list, and the
+time. The texts are hashed exactly as Elasticsearch sends them (the reranker's `field`): no lowercasing, trimming or
+other normalising, of the query or of the documents. Neither texts nor queries are stored, only their hash, so Redis
+holds no document content.
+
+What that means when a query's results change (10 hits, 45 pairs):
+
+| What changed | Comparisons asked again |
+| --- | --- |
+| Nothing: the same query and hits | none |
+| The same hits, in a different BM25 order | none: the answers do not depend on position |
+| One new hit in the top 10 | 9: its pairs with the other nine |
+| One document's text edited | 9: the edited text is a new text |
+| The query typed differently ("Salon chair", "salon chair ") | all 45 |
+| Another query, the same hits | all 45: the judgement depends on the query |
+
+An answer is never served for a text it was not asked about. Entries for texts that are no longer around are just
+not read again, until they are evicted.
+
+**Watch the model name.** `jev-latest` is an alias. If TypeSafe moves it to a new model, the key does not change, and
+the old model's cached answers are mixed with the new one's. Pin a version in `RERANKER_JEV_MODEL` to make an upgrade
+a new key, or set `RERANKER_CACHE_TTL_SECONDS` so that old answers expire.
+
+**Where it is kept:**
+
+- **Without `RERANKER_REDIS_URL`:** in each process's memory, `RERANKER_CACHE_SIZE` entries (100,000), least
+  recently used first out. Several workers or replicas each keep and pay for their own.
+- **With it:** in Redis, shared by every worker and replica. Redis's `maxmemory` policy evicts (the compose stack
+  runs `allkeys-lru` at 256 MB), and `RERANKER_CACHE_TTL_SECONDS`, when set, expires each entry.
+- **If Redis is down,** or slower than `RERANKER_REDIS_TIMEOUT_SECONDS` (0.5), its answers count as misses: the
+  comparisons are asked again and search keeps working.
 
 ## Running it
 
@@ -132,6 +294,10 @@ FAKE_JEV_DELAY_SECONDS=10 ...                                                   
 
 The judge's URL is part of the cache key, so the fake's answers never stand in for real Jev's in Redis.
 
+If you recreate the reranker container (`up --force-recreate reranker`, or a changed setting), restart
+Elasticsearch too (`docker compose restart elasticsearch`, then `docker compose run --rm setup`). Elasticsearch
+keeps the old container's address and its rerank calls fail with "Connection refused".
+
 It is for local use only: Elasticsearch security is off (on a 30-day trial licence) and the ports bind to 127.0.0.1.
 If the default ports are taken, change them with `ES_PORT`, `RERANKER_PORT` and `REDIS_PORT`, e.g.
 `ES_PORT=9201 docker compose up -d`. `WEB_CONCURRENCY` sets the number of reranker workers.
@@ -160,10 +326,8 @@ curl -s localhost:9200/wands/_search -H 'Content-Type: application/json' -d '{
     {"retriever": {"standard": {"query": '"$Q"'}}, "weight": 0.001, "normalizer": "minmax"}]}}}'
 ```
 
-**Cache.** Without `RERANKER_REDIS_URL` each process keeps its own in-memory cache. With it, every worker and replica
-shares one cache in Redis (run Redis with a `maxmemory` policy such as `allkeys-lru`). If Redis is down or slower
-than `RERANKER_REDIS_TIMEOUT_SECONDS`, its answers count as cache misses: the comparisons are asked again, and search
-keeps working.
+**Cache.** Set `RERANKER_REDIS_URL` to share comparisons between workers and replicas (the compose stack does); see
+[What is cached](#what-is-cached).
 
 ## Wiring it into Elasticsearch
 
@@ -261,6 +425,20 @@ RERANKER_TIME_BUDGET_SECONDS=120 .venv/bin/rerank-eval judged-wands.jsonl --per-
 `wands-judged` keeps only queries whose top hits are all labelled and not all graded the same (222 of 480), so no
 grade is guessed, and samples from them with a fixed seed. Raise the time budget for evaluation, so that a slow Jev
 shows up as latency rather than as fallbacks.
+
+**Through Elasticsearch, with the delay it adds.** `es-eval` runs each judged query twice through the stack: as the
+plain search, and reranked (the `linear` retriever of the example). It scores both orders against the grades, as
+above. It also reports search time and the delay reranking adds, at p50, p90, p95, p99 and max. Delay is measured
+twice:
+- **cold**: the first reranked search of each query, when every comparison is new;
+- **warm**: the same searches again, when every comparison comes from the cache, with no Jev cost.
+
+It uses the stack's own settings, including the 8s time budget, so it measures what live traffic would see.
+
+```sh
+docker compose exec redis redis-cli FLUSHDB      # empty the cache, so "cold" is cold
+.venv/bin/es-eval judged-wands-all.jsonl --per-query    # judged-wands-all.jsonl: wands-judged without --sample
+```
 
 **In Quepid:** make two search endpoints for the same index, one with the `text_similarity_reranker` retriever and
 one without, and compare them on a rated case. Elasticsearch does the reranking, so nothing else is needed.
