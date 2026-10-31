@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from reranker.cache import open_cache
 from reranker.config import Settings
 from reranker.jev import JevClient
-from reranker.service import Reranker, rubric
+from reranker.service import RANKERS, Reranker, rubric
 
 
 class RerankRequest(BaseModel):
@@ -76,7 +76,17 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
     @app.post("/v1/rerank", response_model=RerankResponse, dependencies=[Depends(authorised)])
     async def rerank(request: RerankRequest) -> RerankResponse:
-        outcome = await app.state.reranker.rerank(request.query, request.documents, request.top_n)
+        return await answer(request, None)
+
+    @app.post("/v1/rerank/{ranker}", response_model=RerankResponse, dependencies=[Depends(authorised)])
+    async def rerank_with(ranker: str, request: RerankRequest) -> RerankResponse:
+        """The same, with the ranker named in the path (so two Elasticsearch endpoints can compare them)."""
+        if ranker not in RANKERS:
+            raise HTTPException(status_code=404, detail=f"No ranker {ranker!r}; one of {', '.join(RANKERS)}.")
+        return await answer(request, ranker)
+
+    async def answer(request: RerankRequest, ranker: str | None) -> RerankResponse:
+        outcome = await app.state.reranker.rerank(request.query, request.documents, request.top_n, ranker)
         results = [
             RerankResult(
                 index=ranked.index,
@@ -92,6 +102,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             "cycles": outcome.cycles,
             "reason": outcome.reason,
             "beyond_window": outcome.beyond_window,
+            "ranker": outcome.ranker,
+            "rounds": outcome.rounds,
         }
         return RerankResponse(results=results, meta=meta)
 

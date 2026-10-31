@@ -23,21 +23,19 @@ class FakeJev:
         if self.status != 200:
             return httpx.Response(self.status, text="overloaded")
         shown = body["state"]["documents"]
-        choice = "A" if grade(shown["A"]) >= grade(shown["B"]) else "B"
-        return httpx.Response(
-            200,
-            json={
-                "answers": {
-                    "preference": {
-                        "type": "choice",
-                        "choice": choice,
-                        "probabilities": {choice: 0.9},
-                        "confidence": 0.8,
-                    }
-                },
-                "usage": {"input_tokens": 600, "output_tokens": 4},
-            },
-        )
+        answers = {}
+        # One question (a single pair, "A"/"B") or many (a BlitzRank group, "D1".."Dn"): each names its two
+        # documents in its criteria, the one listed first winning a draw.
+        for question_id, question in body["questions"].items():
+            first, second = list(question["criteria"])
+            choice = first if grade(shown[first]) >= grade(shown[second]) else second
+            answers[question_id] = {
+                "type": "choice",
+                "choice": choice,
+                "probabilities": {choice: 0.9},
+                "confidence": 0.8,
+            }
+        return httpx.Response(200, json={"answers": answers, "usage": {"input_tokens": 600, "output_tokens": 4}})
 
 
 def grade(text: str) -> int:

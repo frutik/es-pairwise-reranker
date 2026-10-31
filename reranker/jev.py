@@ -103,10 +103,77 @@ class JevClient:
             output_tokens=_integer(usage.get("output_tokens")),
         )
 
+    def group_request_body(
+        self, query: str, texts: list[str], pairs: list[tuple[int, int]], swapped: list[bool]
+    ) -> dict:
+        """One request asking about several pairs of one group: the group's documents are sent once, as D1..Dn in
+        the order given, and each pair is one question. swapped[n] names the pair's second document first."""
+        labels = [f"D{position + 1}" for position in range(len(texts))]
+        questions = {}
+        for (i, j), swap in zip(pairs, swapped, strict=True):
+            first, second = (labels[j], labels[i]) if swap else (labels[i], labels[j])
+            questions[_pair_id(i, j)] = {
+                "type": "choice",
+                "instructions": f"{self._instructions}\n\nWhich document is more relevant to the query: "
+                f"{first} or {second}?",
+                "criteria": {
+                    first: f"Document {first} is more relevant to the query",
+                    second: f"Document {second} is more relevant to the query",
+                },
+            }
+        return {
+            "model": self._model,
+            "state": {
+                "query": query,
+                "documents": {label: self._cut(text) for label, text in zip(labels, texts, strict=True)},
+            },
+            "questions": questions,
+        }
+
+    async def compare_group(
+        self, query: str, texts: list[str], pairs: list[tuple[int, int]], swapped: list[bool]
+    ) -> tuple[dict[tuple[int, int], Winner], int]:
+        """Each pair's winner (FIRST: the pair's i, the lower position in texts), and Jev's input tokens."""
+        body = await self._post(self.group_request_body(query, texts, pairs, swapped))
+        labels = [f"D{position + 1}" for position in range(len(texts))]
+        answers = body.get("answers") or {}
+        winners = {}
+        for i, j in pairs:
+            answer = answers.get(_pair_id(i, j)) or {}
+            chosen = answer.get("choice")
+            if chosen not in (labels[i], labels[j]):
+                raise JevError(f"Jev gave no readable choice for {_pair_id(i, j)}: {answer!r:.300}")
+            probability = _number((answer.get("probabilities") or {}).get(chosen))
+            if self._tie_band is not None and probability is not None and probability < self._tie_band:
+                winners[(i, j)] = Winner.TIE
+            else:
+                winners[(i, j)] = Winner.FIRST if chosen == labels[i] else Winner.SECOND
+        return winners, _integer((body.get("usage") or {}).get("input_tokens")) or 0
+
+    async def _post(self, request: dict) -> dict:
+        try:
+            response = await self._client.post(
+                self._url,
+                json=request,
+                headers={"Authorization": f"Bearer {self._api_key}"} if self._api_key else {},
+            )
+        except httpx.HTTPError as error:
+            raise JevError(f"could not reach Jev: {error}") from error
+        if response.status_code != 200:
+            raise JevError(f"Jev answered {response.status_code}: {response.text[:300]}")
+        try:
+            return response.json()
+        except ValueError as error:
+            raise JevError(f"Jev did not answer with JSON: {response.text[:300]}") from error
+
     def _cut(self, text: str) -> str:
         if len(text) <= self._max_document_chars:
             return text
         return text[: self._max_document_chars] + TRUNCATION_MARKER
+
+
+def _pair_id(i: int, j: int) -> str:
+    return f"p{i}_{j}"
 
 
 def _number(value) -> float | None:

@@ -34,19 +34,21 @@ def judge(query: str, a: str, b: str) -> tuple[str, float]:
 
 
 def answer(body: dict) -> dict:
+    """Answers every question of the request: one pair ("A"/"B"), or a BlitzRank group's pairs ("D1".."Dn"). Each
+    question names its two documents in its criteria."""
     documents = body["state"]["documents"]
-    choice, probability = judge(body["state"]["query"], documents["A"], documents["B"])
-    return {
-        "answers": {
-            "preference": {
-                "type": "choice",
-                "choice": choice,
-                "probabilities": {choice: probability},
-                "confidence": probability,
-            }
-        },
-        "usage": {"input_tokens": 0, "output_tokens": 0},
-    }
+    answers = {}
+    for question_id, question in body["questions"].items():
+        first, second = list(question["criteria"])
+        choice, probability = judge(body["state"]["query"], documents[first], documents[second])
+        choice = first if choice == "A" else second
+        answers[question_id] = {
+            "type": "choice",
+            "choice": choice,
+            "probabilities": {choice: probability},
+            "confidence": probability,
+        }
+    return {"answers": answers, "usage": {"input_tokens": 0, "output_tokens": 0}}
 
 
 class Handler(BaseHTTPRequestHandler):

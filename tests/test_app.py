@@ -33,6 +33,8 @@ def test_answers_in_the_shape_the_elasticsearch_endpoint_reads(client):
         "cycles": 0,
         "reason": None,
         "beyond_window": 0,
+        "ranker": "round-robin",
+        "rounds": 0,
     }
     assert all(result["document"] is None for result in body["results"])
 

@@ -14,6 +14,7 @@ import hashlib
 import logging
 from dataclasses import dataclass, field
 
+from reranker.blitz import blitz_sort
 from reranker.cache import ComparisonCache
 from reranker.config import Settings
 from reranker.jev import JevClient, JevError
@@ -43,6 +44,8 @@ class Outcome:
     cycles: int = 0
     reason: str | None = None
     beyond_window: int = 0  # hits past max_documents, not reranked
+    ranker: str = "round-robin"
+    rounds: int = 0  # Jev requests made one after another (round-robin: none, they all go at once)
     stats: dict = field(default_factory=dict)
 
 
@@ -59,17 +62,33 @@ def rubric(settings: Settings) -> str:
     return hashlib.sha256("\u0000".join(parts).encode()).hexdigest()
 
 
+RANKERS = ("round-robin", "blitz")
+
+
+def blitz_rubric(settings: Settings) -> str:
+    """BlitzRank asks each pair among the other documents of its group, not alone: another question, so its answers
+    are kept apart from round-robin's."""
+    return hashlib.sha256(f"blitz\u0000{rubric(settings)}".encode()).hexdigest()
+
+
 class Reranker:
     def __init__(self, jev: JevClient, cache: ComparisonCache, settings: Settings):
         self._jev = jev
         self._cache = cache
         self._settings = settings
         self._rubric = rubric(settings)
+        self._blitz_rubric = blitz_rubric(settings)
 
-    async def rerank(self, query: str, documents: list[str], top_n: int | None = None) -> Outcome:
+    async def rerank(
+        self, query: str, documents: list[str], top_n: int | None = None, ranker: str | None = None
+    ) -> Outcome:
+        ranker = ranker or self._settings.ranker
+        if ranker not in RANKERS:
+            raise ValueError(f"unknown ranker {ranker!r}; one of {', '.join(RANKERS)}")
         window = documents[: self._settings.max_documents]
+        rank = self._rank if ranker == "round-robin" else self._rank_blitz
         try:
-            outcome = await asyncio.wait_for(self._rank(query, window), timeout=self._settings.time_budget_seconds)
+            outcome = await asyncio.wait_for(rank(query, window), timeout=self._settings.time_budget_seconds)
         except TimeoutError:
             outcome = self._search_order(len(window), f"time budget of {self._settings.time_budget_seconds}s ran out")
         except JevError as error:
@@ -133,6 +152,62 @@ class Reranker:
             cycles=ranked.cycles,
             input_tokens=tokens,
         )
+
+    async def _rank_blitz(self, query: str, window: list[str]) -> Outcome:
+        count = len(window)
+        every_pair = pairs(count)
+        cached = await self._cache.get_many(
+            query, [(window[i], window[j]) for i, j in every_pair], rubric=self._blitz_rubric
+        )
+        known = {pair: winner for pair, winner in zip(every_pair, cached, strict=True) if winner is not None}
+        tokens = 0
+
+        async def ask(group: list[int], missing: list[tuple[int, int]]) -> dict[tuple[int, int], Winner]:
+            nonlocal tokens
+            # Documents are labelled D1..Dn in an order fixed by their text, not by how good the graph thinks they
+            # are, so that the judge's lean towards early labels does not favour the leaders.
+            members = sorted(group, key=lambda position: self._shuffle_key(query, window[position]))
+            local = {position: index for index, position in enumerate(members)}
+            asked_pairs, flipped = [], []
+            for i, j in missing:
+                a, b = local[i], local[j]
+                asked_pairs.append((min(a, b), max(a, b)))
+                flipped.append(a > b)
+            swaps = [swapped(query, window[members[a]], window[members[b]], self._blitz_rubric) for a, b in asked_pairs]
+            winners, used = await self._jev.compare_group(
+                query, [window[position] for position in members], asked_pairs, swaps
+            )
+            tokens += used
+            answers = {}
+            for (i, j), local_pair, flip in zip(missing, asked_pairs, flipped, strict=True):
+                winner = winners[local_pair]
+                if flip:
+                    winner = {Winner.FIRST: Winner.SECOND, Winner.SECOND: Winner.FIRST}.get(winner, winner)
+                answers[(i, j)] = winner
+                await self._cache.put(query, window[i], window[j], winner, rubric=self._blitz_rubric)
+            return answers
+
+        settings = self._settings
+        result = await blitz_sort(count, settings.blitz_k, settings.blitz_top_m, ask, known, settings.blitz_max_rounds)
+        others = max(count - 1, 1)
+        # The top: the share of the others not known to be better, equal for documents tied in a cycle. The rest of
+        # the window: no opinion, below the top (BlitzRank does not rank past it).
+        results = [Ranked(index, (others - better) / others) for index, better in result.top]
+        results += [Ranked(index, _NO_OPINION - 0.5) for index in result.rest]
+        return Outcome(
+            results=results,
+            reranked=True,
+            comparisons=len(known) + result.asked,
+            asked=result.asked,
+            cycles=result.cycles,
+            input_tokens=tokens,
+            ranker="blitz",
+            rounds=result.rounds,
+            reason=None if result.certain else "stopped before the top was certain",
+        )
+
+    def _shuffle_key(self, query: str, text: str) -> str:
+        return hashlib.sha256("\u0000".join([self._blitz_rubric, query, text]).encode()).hexdigest()
 
     @staticmethod
     def _search_order(count: int, reason: str) -> Outcome:

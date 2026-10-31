@@ -26,6 +26,14 @@ class Settings(BaseSettings):
 
     # How many of the hits are reranked: n of them take n(n-1)/2 comparisons. Hits past this keep their order, below.
     max_documents: int = 20
+    # How the window is ranked, unless the request's path names one (/v1/rerank/<ranker>):
+    #   round-robin  every pair asked, one request each, ranked by wins (the measured method)
+    #   blitz        BlitzRank: groups of blitz_k asked a round at a time (one request each, every pair of the group),
+    #                until the top blitz_top_m are certain; the rest of the window is left unranked, below them
+    ranker: str = "round-robin"
+    blitz_k: int = 10
+    blitz_top_m: int = 10
+    blitz_max_rounds: int = 50
     # Jev requests in flight at once, for one rerank.
     concurrency: int = 16
     # How long one Jev request may take, and how long a whole rerank may. Past the budget, the search's own order is

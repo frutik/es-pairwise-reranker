@@ -164,6 +164,17 @@ def run(arguments, queries: list[dict], out=sys.stdout) -> dict:
     print("\nAgreement with the grades", file=out)
     summary = report(scores, out)
     summary["delay"] = {"plain": plain_seconds, "cold": cold_seconds, "warm": warm_seconds}
+    if arguments.save:
+        with open(arguments.save, "w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "queries": [line["query"] for line in queries],
+                    "scores": scores,
+                    "delay": summary["delay"],
+                    "inference_id": arguments.inference_id,
+                },
+                file,
+            )
     return summary
 
 
@@ -183,6 +194,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--timeout", type=float, default=60, help="seconds a search may take")
     parser.add_argument("--limit", type=int, help="only the first this many queries")
     parser.add_argument("--per-query", action="store_true", help="print each query's times and tau-b")
+    parser.add_argument("--save", help="write each query's measures and times to this JSON file")
     arguments = parser.parse_args(argv)
     with open(arguments.judged, encoding="utf-8") as file:
         queries = [json.loads(line) for line in file if line.strip()][: arguments.limit]

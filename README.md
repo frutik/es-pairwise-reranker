@@ -24,19 +24,17 @@ Comparing every pair is the most expensive way to get an order from pairwise ans
 cheaper or better, roughly in order of promise. Each one has to be measured against the current version (see
 [Evaluating](#evaluating)) before it replaces it.
 
-- **BlitzRank** ([Agrawal, Nguyen and Kiela, ICML 2026](https://arxiv.org/abs/2602.05448);
-  [code](https://github.com/ContextualAI/BlitzRank), `pip install blitzrank`). It asks the judge to order a small
-  set of `k` documents at once, which gives every pairwise preference within that set in one call. It collects these
-  into one tournament graph and uses transitivity (A beats B, B beats C, so A beats C) to infer orderings it never
-  asked about. The paper reports quality close to full pairwise ranking with about 7× fewer tokens, across 14
-  benchmarks and 5 models. Two open questions here: Jev would have to answer a `k`-way question instead of an A/B
-  one, and the swap against position bias would need a counterpart for orderings of `k` documents.
+- **BlitzRank: done, and it works** (see [BlitzRank: a window of 30](#blitzrank-a-window-of-30)). On a window of
+  30 it gives round-robin's quality with about 4× less delay and 8× fewer tokens. `RERANKER_RANKER=blitz`, or call
+  `/v1/rerank/blitz`.
 - **Comparison sort**: a sort that uses the judge as its comparator needs about `n log n` comparisons, not `n²/2`.
   Quepid has one to port (`app/services/pair_ranking/comparison_sort.rb`). Round-robin copes with a judge that
   contradicts itself (82 cycles in 991 comparisons in the experiments); a sort does not, so check how much accuracy
   that costs.
-- **Batching**: send a query's pairs to Jev as several questions in one request, with the documents in the state
-  once. This leaves the method unchanged and cuts requests and latency.
+- **Batching round-robin**: send a query's pairs to Jev as several questions in one request, with the documents in
+  the state once, as BlitzRank's rounds already do. This leaves round-robin unchanged and cuts requests and latency.
+- **A smaller BlitzRank group, or more of them in parallel**: BlitzRank's rounds run one after another, about 0.2 s
+  each, so its delay is the number of rounds. Groups of other sizes than 10 were not tried.
 - **Richer documents**: rerank on a combined field (title, brand, description) rather than the title alone. The
   experiments showed Jev whole records with named fields.
 
@@ -179,9 +177,71 @@ because every comparison comes from the cache.
 on WANDS), that is about 272,000 tokens per new query, 10× the window of 10, and about 55 million for the run.
 
 **What it is good for as it is:** work that can wait, such as offline reranking, precomputing the most frequent
-queries, or warming the cache in advance. For live search, the number of rounds has to come down. One way is
-batching a group's pairs into one Jev request; another is a BlitzRank-style schedule that asks only what can change
-the top 10 (see [What to try next](#what-to-try-next)).
+queries, or warming the cache in advance. For live search, the number of rounds has to come down, which is what
+BlitzRank does (next).
+
+### BlitzRank: a window of 30
+
+**Round-robin's quality at a quarter of the delay and an eighth of the tokens.** The same 204 queries, window 30
+and top 10 as above, ranked with [BlitzRank](https://arxiv.org/abs/2602.05448) instead of round-robin.
+
+**How it runs here** (`reranker/blitz.py`, ported from the authors' package, `blitzrank` 0.1.0):
+- **Rounds:** each round asks Jev about a group of 10 documents, every pair of the group in **one request** (the
+  documents sent once, one question per pair). The answers go into one preference graph, and its transitive closure
+  infers pairs nobody asked.
+- **Ties:** documents that beat each other in a circle count as tied.
+- **Stopping:** a document is final once its relation to every other is known, and rounds stop when 10 are final.
+- **The next group:** one document from each of the 10 best unfinished groups of tied documents, so every round asks
+  only what is still open.
+- **The rest:** BlitzRank does not order positions 11–30, so they get equal scores below the top 10, in BM25 order.
+- **Differences from the authors' code:**
+  - Their judge orders the group (a listwise LLM call). Jev answers each pair of the group, which gives at least as
+    much: a full tournament.
+  - A pair already answered is not asked again.
+  - Documents are labelled D1..D10 in an order fixed by their text, not by how good they look so far.
+
+**Agreement with the human labels:**
+
+| Measure (top 10) | BM25 | Round-robin | BlitzRank | BlitzRank − round-robin | 95% interval |
+| --- | --- | --- | --- | --- | --- |
+| nDCG@10 | 0.808 | 0.921 | 0.919 | −0.002 | −0.008 to +0.004 |
+| tau-b@10 | 0.173 | 0.323 | 0.322 | +0.006 | −0.027 to +0.037 |
+| Pairwise accuracy@10 | 0.651 | 0.778 | 0.772 | −0.000 | −0.032 to +0.030 |
+
+No difference between the two. The intervals are narrow and centred on zero, and BlitzRank gave the same nDCG@10 as
+round-robin on 124 of 204 queries. Against BM25, BlitzRank gains +0.111 nDCG@10 (+0.087 to +0.137).
+
+**Delay reranking adds** (per query, as the Elasticsearch client sees it):
+
+| Added | p50 | p90 | p95 | p99 | max |
+| --- | --- | --- | --- | --- | --- |
+| Round-robin, cold cache | +4,898 ms | +5,029 ms | +5,050 ms | +5,080 ms | +5,206 ms |
+| **BlitzRank, cold cache** | **+1,133 ms** | +1,296 ms | +1,348 ms | +1,398 ms | +1,697 ms |
+| BlitzRank, warm cache | +53 ms | +57 ms | +58 ms | +62 ms | +293 ms |
+
+**Cost per new query** (measured in-process on 20 of the queries):
+
+| | Pairs asked | Jev requests | One after another | Input tokens |
+| --- | --- | --- | --- | --- |
+| Round-robin | 435 | 435 | about 27 rounds of 16 | about 272,000 |
+| **BlitzRank** | **195** (median) | 5 | 5 rounds (6 at most) | **about 33,000** |
+
+All 20 reached a certain top 10. Against round-robin's run, BlitzRank's delay is 4.3× smaller and its tokens 8×
+fewer. The paper reports 7× fewer tokens than pairwise ranking with other models.
+
+**What is still slow:** 1.1 s is for a query nobody has asked before. That is closer to live search than 4.9 s, but
+still a second.
+
+**To try it:** `RERANKER_RANKER=blitz` makes it the default. Or keep round-robin and register a second endpoint on
+`/v1/rerank/blitz`:
+
+```sh
+docker compose run --rm -e RERANKER_URL=http://reranker:8000/v1/rerank/blitz -e INFERENCE_ID=pairwise-blitz setup
+.venv/bin/es-eval judged-wands-30.jsonl --window 30 --depth 10 --inference-id pairwise-blitz --save blitz.json
+```
+
+`RERANKER_BLITZ_K` (10) is the group size and `RERANKER_BLITZ_TOP_M` (10) how many it ranks. Its answers are cached
+apart from round-robin's: a pair judged among ten documents is not the same question as a pair judged alone.
 
 To reproduce:
 
@@ -445,10 +505,9 @@ one without, and compare them on a rated case. Elasticsearch does the reranking,
 
 ## Not done yet
 
-- **Batching.** Jev can answer several questions in one request with the documents sent once, which would cut
-  requests and latency a lot. It was not measured in the experiments, so it is not used yet.
-- **Cheaper rankers.** BlitzRank or comparison sort, for windows larger than about 20; see
-  [What to try next](#what-to-try-next).
+- **Batching round-robin.** BlitzRank sends a group's pairs in one request. Round-robin still sends one pair per
+  request, as the experiments measured.
+- **Comparison sort** as another cheaper ranker; see [What to try next](#what-to-try-next).
 - **Checked on one Elasticsearch version only**: 9.5.5, the compose stack. The endpoint is accepted, the reranked
   order is applied, and the `linear` retriever breaks ties and the fallback in BM25 order. Elasticsearch shifts the
   returned scores (+1, and negative ones into (0, 1)) but keeps their order. 8.19 has not been tried.

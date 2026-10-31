@@ -24,11 +24,12 @@ Pair = tuple[str, str]
 
 
 class ComparisonCache(Protocol):
-    async def get_many(self, query: str, pairs: list[Pair]) -> list[Winner | None]:
-        """Each pair's winner (in the pair's own order), or None when it has not been asked."""
+    async def get_many(self, query: str, pairs: list[Pair], rubric: str | None = None) -> list[Winner | None]:
+        """Each pair's winner (in the pair's own order), or None when it has not been asked. rubric: another
+        question than the cache's own (another ranker asks it differently)."""
         ...
 
-    async def put(self, query: str, first: str, second: str, winner: Winner) -> None: ...
+    async def put(self, query: str, first: str, second: str, winner: Winner, rubric: str | None = None) -> None: ...
 
 
 def entry_key(rubric: str, query: str, first: str, second: str) -> tuple[str, bool]:
@@ -51,13 +52,13 @@ class MemoryCache:
         self._rubric = rubric
         self._entries: OrderedDict[str, Winner] = OrderedDict()
 
-    async def get_many(self, query: str, pairs: list[Pair]) -> list[Winner | None]:
-        return [self._get(query, first, second) for first, second in pairs]
+    async def get_many(self, query: str, pairs: list[Pair], rubric: str | None = None) -> list[Winner | None]:
+        return [self._get(rubric or self._rubric, query, first, second) for first, second in pairs]
 
-    async def put(self, query: str, first: str, second: str, winner: Winner) -> None:
+    async def put(self, query: str, first: str, second: str, winner: Winner, rubric: str | None = None) -> None:
         if self._size <= 0:
             return
-        key, flipped = entry_key(self._rubric, query, first, second)
+        key, flipped = entry_key(rubric or self._rubric, query, first, second)
         self._entries[key] = _as_stored(winner, flipped)
         self._entries.move_to_end(key)
         while len(self._entries) > self._size:
@@ -66,8 +67,8 @@ class MemoryCache:
     def __len__(self) -> int:
         return len(self._entries)
 
-    def _get(self, query: str, first: str, second: str) -> Winner | None:
-        key, flipped = entry_key(self._rubric, query, first, second)
+    def _get(self, rubric: str, query: str, first: str, second: str) -> Winner | None:
+        key, flipped = entry_key(rubric, query, first, second)
         winner = self._entries.get(key)
         if winner is None:
             return None
@@ -86,10 +87,10 @@ class RedisCache:
         self._rubric = rubric
         self._ttl = ttl_seconds or None
 
-    async def get_many(self, query: str, pairs: list[Pair]) -> list[Winner | None]:
+    async def get_many(self, query: str, pairs: list[Pair], rubric: str | None = None) -> list[Winner | None]:
         if not pairs:
             return []
-        keys = [entry_key(self._rubric, query, first, second) for first, second in pairs]
+        keys = [entry_key(rubric or self._rubric, query, first, second) for first, second in pairs]
         try:
             values = await self._client.mget([self.KEY_PREFIX + key for key, _ in keys])
         except (redis.RedisError, OSError) as error:
@@ -97,8 +98,8 @@ class RedisCache:
             return [None] * len(pairs)
         return [self._read(value, flipped) for value, (_, flipped) in zip(values, keys, strict=True)]
 
-    async def put(self, query: str, first: str, second: str, winner: Winner) -> None:
-        key, flipped = entry_key(self._rubric, query, first, second)
+    async def put(self, query: str, first: str, second: str, winner: Winner, rubric: str | None = None) -> None:
+        key, flipped = entry_key(rubric or self._rubric, query, first, second)
         try:
             await self._client.set(self.KEY_PREFIX + key, _as_stored(winner, flipped).value, ex=self._ttl)
         except (redis.RedisError, OSError) as error:

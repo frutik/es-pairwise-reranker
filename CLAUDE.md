@@ -71,8 +71,11 @@ Invariants that span modules:
   only for callers that send hits in that order (`rerank-eval`).
 - **Scores** are the share of the other hits beaten (0..1). They only sort hits within one query and cannot be
   compared across queries.
-- **One comparison per Jev request**, in the exact shape the Quepid experiments measured. Batching is deliberately not
-  done yet. Measure it against the current version before you switch.
+- **Two rankers**, chosen by `RERANKER_RANKER` or the path `/v1/rerank/<ranker>`. `round-robin` (`ranking.py`) asks
+  every pair, one Jev request each, in the exact shape the Quepid experiments measured. `blitz` (`blitz.py`, BlitzRank
+  ported from the authors' package) asks a group of `blitz_k` per round, every pair of the group in one request
+  (`JevClient.compare_group`), until the top `blitz_top_m` are certain, and leaves the rest of the window unranked.
+  Its answers use their own rubric (`blitz_rubric`), apart from round-robin's.
 
 Tests: `tests/test_cache.py` runs each cache test against both stores (Redis via `fakeredis`). `tests/conftest.py`
 provides `FakeJev`, an `httpx.MockTransport` handler that acts as a perfect judge. A document whose text ends in a
