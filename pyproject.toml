@@ -23,6 +23,7 @@ dev = [
 [project.scripts]
 rerank-eval = "eval.evaluate:main"
 wands-load = "eval.wands:main"
+wands-judged = "eval.wands:main_judged"
 
 [build-system]
 requires = ["setuptools>=69"]

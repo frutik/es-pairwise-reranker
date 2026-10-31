@@ -247,7 +247,20 @@ Before sending traffic through it, check that it beats your current order on you
 # pairwise accuracy        0.xxx     0.xxx
 ```
 
-It calls Jev for real, so it costs what the comparisons cost.
+It calls Jev for real, so it costs what the comparisons cost. Besides the means it prints, per measure, the mean
+difference, a 95% paired bootstrap interval for it, and on how many queries reranking was better, the same or worse.
+`--per-query` prints each query's tau-b before and after.
+
+**On WANDS**, with the `wands` index loaded (see [Running it](#running-it)):
+
+```sh
+.venv/bin/wands-judged judged-wands.jsonl --sample 30 --seed 0   # BM25 top 10 per query, graded with WANDS' labels
+RERANKER_TIME_BUDGET_SECONDS=120 .venv/bin/rerank-eval judged-wands.jsonl --per-query
+```
+
+`wands-judged` keeps only queries whose top hits are all labelled and not all graded the same (222 of 480), so no
+grade is guessed, and samples from them with a fixed seed. Raise the time budget for evaluation, so that a slow Jev
+shows up as latency rather than as fallbacks.
 
 **In Quepid:** make two search endpoints for the same index, one with the `text_similarity_reranker` retriever and
 one without, and compare them on a rated case. Elasticsearch does the reranking, so nothing else is needed.

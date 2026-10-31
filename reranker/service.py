@@ -39,6 +39,7 @@ class Outcome:
     reranked: bool  # False when the search's order came back instead (fail open)
     comparisons: int = 0
     asked: int = 0  # comparisons that were not in the cache
+    input_tokens: int = 0  # what the asked comparisons cost, as Jev reported it
     cycles: int = 0
     reason: str | None = None
     beyond_window: int = 0  # hits past max_documents, not reranked
@@ -102,12 +103,15 @@ class Reranker:
                 answers[(i, j)] = winner
 
         limit = asyncio.Semaphore(self._settings.concurrency)
+        tokens = 0
 
         async def ask(i: int, j: int) -> None:
+            nonlocal tokens
             async with limit:
                 swap = swapped(query, window[i], window[j], self._rubric)
                 comparison = await self._jev.compare(query, window[i], window[j], swapped=swap)
             answers[(i, j)] = comparison.winner
+            tokens += comparison.input_tokens or 0
             await self._cache.put(query, window[i], window[j], comparison.winner)
 
         failures = [
@@ -122,7 +126,12 @@ class Reranker:
         others = max(len(window) - 1, 1)
         results = [Ranked(index, ranked.scores[index] / others) for index in ranked.order]
         return Outcome(
-            results=results, reranked=True, comparisons=len(answers), asked=len(missing), cycles=ranked.cycles
+            results=results,
+            reranked=True,
+            comparisons=len(answers),
+            asked=len(missing),
+            cycles=ranked.cycles,
+            input_tokens=tokens,
         )
 
     @staticmethod

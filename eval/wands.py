@@ -6,6 +6,11 @@ Elasticsearch index, to try the reranker on.
 The product file (90 MB) is downloaded from GitHub the first time, into --data-dir, unless it is already there. The
 index is dropped and made again, so the load can be re-run.
 
+    wands-judged judged.jsonl [--sample 30] [--seed 0] [--size 10]
+
+wands-judged then writes rerank-eval's input: WANDS' queries, each with the top hits of a BM25 search on the index in
+that order, graded with WANDS' labels (Exact 2, Partial 1, Irrelevant 0).
+
 Each product keeps WANDS' fields, plus `rerank_text`: the field to point the text_similarity_reranker at. Elasticsearch
 sends the judge only that one field. It joins the fields Quepid's WANDS experiment showed Jev (name, category, product
 class, description), so the judge sees what it saw there.
@@ -15,7 +20,9 @@ import argparse
 import csv
 import json
 import os
+import random
 import sys
+from collections import Counter, defaultdict
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -175,6 +182,89 @@ def _bulk(client: httpx.Client, index: str, lines: list[str]) -> int:
         failed = next(item["index"] for item in body["items"] if "error" in item["index"])
         raise WandsError(f"bulk load failed for product {failed['_id']}: {failed['error']}")
     return len(body["items"])
+
+
+GRADES = {"Exact": 2, "Partial": 1, "Irrelevant": 0}
+SEARCH_FIELDS = ["product_name^3", "product_class", "category_hierarchy", "product_description"]
+
+
+def labels(data_dir: Path) -> dict[str, dict[str, int]]:
+    """query id -> product id -> grade. WANDS labels some pairs more than once and a few disagree: the most common
+    label is kept, and the higher of two that tie (as Quepid's WANDS case does)."""
+    seen: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for row in rows(fetch("label", data_dir)):
+        if row["label"] in GRADES:
+            seen[(row["query_id"], row["product_id"])].append(GRADES[row["label"]])
+    graded: dict[str, dict[str, int]] = defaultdict(dict)
+    for (query_id, product_id), grades in seen.items():
+        graded[query_id][product_id] = max(Counter(grades).items(), key=lambda item: (item[1], item[0]))[0]
+    return graded
+
+
+def search_query(text: str) -> dict:
+    return {"multi_match": {"query": text, "fields": SEARCH_FIELDS}}
+
+
+def judged(es: str, index: str, data_dir: Path, sample: int | None, seed: int, size: int) -> tuple[list[dict], dict]:
+    """The judged queries, and counts of why the others were left out. A query is kept only when every one of its
+    top hits is labelled (so no grade is guessed) and they do not all have one grade (no order can change those)."""
+    graded = labels(data_dir)
+    queries = [
+        (row["query_id"], row["query"].strip()) for row in rows(fetch("query", data_dir)) if row["query"].strip()
+    ]
+    kept, left_out = [], Counter()
+    with httpx.Client(base_url=es, timeout=60) as client:
+        for query_id, text in queries:
+            response = client.post(
+                f"/{index}/_search", json={"size": size, "_source": ["rerank_text"], "query": search_query(text)}
+            )
+            if response.status_code != 200:
+                raise WandsError(f"search failed: {response.status_code} {response.text[:300]}")
+            hits = response.json()["hits"]["hits"]
+            grades = [graded[query_id].get(hit["_id"]) for hit in hits]
+            if len(hits) < 2:
+                left_out["fewer than 2 hits"] += 1
+            elif None in grades:
+                left_out["a hit is unlabelled"] += 1
+            elif len(set(grades)) == 1:
+                left_out["all hits graded the same"] += 1
+            else:
+                kept.append(
+                    {
+                        "query": text,
+                        "query_id": query_id,
+                        "documents": [
+                            {"id": hit["_id"], "text": hit["_source"]["rerank_text"], "grade": grade}
+                            for hit, grade in zip(hits, grades, strict=True)
+                        ],
+                    }
+                )
+    if sample is not None and sample < len(kept):
+        chosen = sorted(random.Random(seed).sample(range(len(kept)), sample))
+        kept = [kept[i] for i in chosen]
+    return kept, {"queries": len(queries), **left_out}
+
+
+def main_judged(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("output", type=Path, help="the judged.jsonl to write")
+    parser.add_argument("--es", default=os.environ.get("ES_URL", "http://localhost:9200"), help="Elasticsearch URL")
+    parser.add_argument("--index", default="wands")
+    parser.add_argument("--data-dir", type=Path, default=Path("data/wands"), help="where the WANDS files are kept")
+    parser.add_argument("--sample", type=int, help="a random sample of this many of the usable queries")
+    parser.add_argument("--seed", type=int, default=0, help="for the sample, so it can be drawn again")
+    parser.add_argument("--size", type=int, default=10, help="top hits per query (keep it <= max_documents)")
+    arguments = parser.parse_args(argv)
+    try:
+        kept, counts = judged(
+            arguments.es, arguments.index, arguments.data_dir, arguments.sample, arguments.seed, arguments.size
+        )
+    except (WandsError, httpx.HTTPError) as error:
+        sys.exit(f"wands-judged: {error}")
+    with arguments.output.open("w", encoding="utf-8") as out:
+        for line in kept:
+            out.write(json.dumps(line, ensure_ascii=False) + "\n")
+    print(f"{len(kept)} queries written to {arguments.output}; of {counts.pop('queries')}, left out: {dict(counts)}")
 
 
 def main(argv: list[str] | None = None) -> None:
