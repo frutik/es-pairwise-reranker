@@ -98,3 +98,25 @@ async def test_opens_redis_only_when_a_url_is_set():
         assert isinstance(cache, RedisCache)
         # Nothing listens there: a miss, quickly, not an error.
         assert await get(cache, "q", "a", "b") is None
+
+
+async def test_keeps_a_querys_questions_apart_from_other_queries_and_prompts(make_cache):
+    cache = make_cache()
+    await cache.put_questions("prompt-a", "desk for kids", ["Is it a desk?", "Is it for children?"])
+
+    assert await cache.get_questions("prompt-a", "desk for kids") == ["Is it a desk?", "Is it for children?"]
+    assert await cache.get_questions("prompt-a", "desk") is None
+    assert await cache.get_questions("prompt-b", "desk for kids") is None
+
+
+async def test_a_redis_that_is_down_has_no_questions_and_keeping_them_does_not_fail():
+    class Down:
+        async def get(self, key):
+            raise ConnectionError("down")
+
+        async def set(self, *args, **kwargs):
+            raise ConnectionError("down")
+
+    cache = RedisCache(Down(), "rubric")
+    await cache.put_questions("r", "q", ["Is it?"])
+    assert await cache.get_questions("r", "q") is None

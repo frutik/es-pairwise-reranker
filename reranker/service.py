@@ -18,6 +18,7 @@ from reranker.blitz import blitz_sort
 from reranker.cache import ComparisonCache
 from reranker.config import Settings
 from reranker.jev import JevClient, JevError
+from reranker.questions import QuestionGenerator, questions_rubric
 from reranker.ranking import RoundRobin, Winner, pairs, swapped
 
 log = logging.getLogger(__name__)
@@ -62,7 +63,7 @@ def rubric(settings: Settings) -> str:
     return hashlib.sha256("\u0000".join(parts).encode()).hexdigest()
 
 
-RANKERS = ("round-robin", "blitz")
+RANKERS = ("round-robin", "blitz", "decisions")
 
 
 def blitz_rubric(settings: Settings) -> str:
@@ -72,8 +73,12 @@ def blitz_rubric(settings: Settings) -> str:
 
 
 class Reranker:
-    def __init__(self, jev: JevClient, cache: ComparisonCache, settings: Settings):
+    def __init__(
+        self, jev: JevClient, cache: ComparisonCache, settings: Settings, questions: QuestionGenerator | None = None
+    ):
         self._jev = jev
+        self._questions = questions
+        self._questions_rubric = questions_rubric(settings)
         self._cache = cache
         self._settings = settings
         self._rubric = rubric(settings)
@@ -86,7 +91,7 @@ class Reranker:
         if ranker not in RANKERS:
             raise ValueError(f"unknown ranker {ranker!r}; one of {', '.join(RANKERS)}")
         window = documents[: self._settings.max_documents]
-        rank = self._rank if ranker == "round-robin" else self._rank_blitz
+        rank = {"round-robin": self._rank, "blitz": self._rank_blitz, "decisions": self._rank_decisions}[ranker]
         try:
             outcome = await asyncio.wait_for(rank(query, window), timeout=self._settings.time_budget_seconds)
         except TimeoutError:
@@ -204,6 +209,45 @@ class Reranker:
             ranker="blitz",
             rounds=result.rounds,
             reason=None if result.certain else "stopped before the top was certain",
+        )
+
+    async def _rank_decisions(self, query: str, window: list[str]) -> Outcome:
+        if len(window) < 2:
+            results = [Ranked(index, _NO_OPINION) for index in range(len(window))]
+            return Outcome(results=results, reranked=True, ranker="decisions")
+        stats = {"llm_input_tokens": 0, "llm_output_tokens": 0, "questions_cached": True}
+        questions = await self._cache.get_questions(self._questions_rubric, query)
+        if questions is None:
+            if self._questions is None:
+                raise JevError("no question LLM configured")
+            written = await self._questions.generate(query)
+            questions = written.questions
+            stats.update(
+                llm_input_tokens=written.input_tokens, llm_output_tokens=written.output_tokens, questions_cached=False
+            )
+            await self._cache.put_questions(self._questions_rubric, query, questions)
+        stats["questions"] = len(questions)
+
+        limit = asyncio.Semaphore(self._settings.concurrency)
+
+        async def decide(text: str) -> tuple[float, int]:
+            async with limit:
+                return await self._jev.decide(text, questions)
+
+        answers = await asyncio.gather(*(decide(text) for text in window), return_exceptions=True)
+        failures = [answer for answer in answers if isinstance(answer, BaseException)]
+        if failures:
+            raise failures[0] if isinstance(failures[0], JevError) else JevError(repr(failures[0]))
+        # The article's score is the sum of P(yes); the mean orders the same and stays in 0..1, under the tie-break.
+        scores = [total / len(questions) for total, _ in answers]
+        order = sorted(range(len(window)), key=lambda index: (-scores[index], index))
+        return Outcome(
+            results=[Ranked(index, scores[index]) for index in order],
+            reranked=True,
+            asked=len(window),
+            input_tokens=sum(tokens for _, tokens in answers),
+            ranker="decisions",
+            stats=stats,
         )
 
     def _shuffle_key(self, query: str, text: str) -> str:

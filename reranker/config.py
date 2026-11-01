@@ -30,10 +30,27 @@ class Settings(BaseSettings):
     #   round-robin  every pair asked, one request each, ranked by wins (the measured method)
     #   blitz        BlitzRank: groups of blitz_k asked a round at a time (one request each, every pair of the group),
     #                until the top blitz_top_m are certain; the rest of the window is left unranked, below them
-    ranker: str = "round-robin"
+    ranker: str = "round-robin"  # or blitz, or decisions (below)
     blitz_k: int = 10
     blitz_top_m: int = 10
     blitz_max_rounds: int = 50
+    # The decisions ranker (bag of decisions): an LLM writes the query's yes/no questions (kept in the cache, so once
+    # per query), Jev answers all of them for each hit in one request, and hits are ordered by the mean P(yes).
+    # The question LLM: any OpenAI-compatible chat-completions API. Prompts are the article's.
+    questions_url: str = "https://api.openai.com/v1/chat/completions"
+    questions_api_key: str = ""
+    questions_model: str = "gpt-5"
+    # Empty: the API's default (the article set none). "minimal"/"low" make a new query wait less.
+    questions_reasoning_effort: str = ""
+    questions_timeout_seconds: float = 60.0
+    questions_system_prompt: str = (
+        "You are a search relevance decision engine. You will be given a query, and your job is to generate a list of "
+        "yes/no questions that can be used to determine if a document is relevant to the query."
+    )
+    questions_prompt: str = (
+        "For the given query, please generate a list of yes/no questions where the affirmative\n"
+        "indicates the document is relevant to the query.\n\nHere's the query:\n\n{query}"
+    )
     # Jev requests in flight at once, for one rerank.
     concurrency: int = 16
     # How long one Jev request may take, and how long a whole rerank may. Past the budget, the search's own order is

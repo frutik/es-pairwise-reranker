@@ -17,6 +17,7 @@ noise; one that spans zero is not a result yet.
 import argparse
 import asyncio
 import json
+import math
 import random
 import statistics
 import sys
@@ -28,6 +29,7 @@ from reranker.cache import open_cache
 from reranker.config import Settings
 from reranker.jev import JevClient
 from reranker.metrics import kendall_tau_b, ndcg, pairwise_accuracy
+from reranker.questions import QuestionGenerator
 from reranker.service import Reranker, rubric
 
 MEASURES = {"nDCG@10": ndcg, "tau-b": kendall_tau_b, "pairwise accuracy": pairwise_accuracy}
@@ -43,7 +45,14 @@ def measures_at(depth: int) -> dict:
     }
 
 
-async def evaluate(queries: list[dict], settings: Settings, out=sys.stdout, per_query: bool = False) -> dict:
+async def evaluate(
+    queries: list[dict],
+    settings: Settings,
+    out=sys.stdout,
+    per_query: bool = False,
+    ranker: str | None = None,
+    depth: int | None = None,
+) -> dict:
     async with (
         httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client,
         open_cache(settings, rubric(settings)) as cache,
@@ -57,30 +66,42 @@ async def evaluate(queries: list[dict], settings: Settings, out=sys.stdout, per_
             tie_band=settings.tie_band,
             max_document_chars=settings.max_document_chars,
         )
-        return await evaluate_with(Reranker(jev, cache, settings), queries, out, per_query)
+        reranker = Reranker(jev, cache, settings, QuestionGenerator(client, settings))
+        return await evaluate_with(reranker, queries, out, per_query, ranker, depth)
 
 
-async def evaluate_with(reranker: Reranker, queries: list[dict], out=sys.stdout, per_query: bool = False) -> dict:
-    scores = {"search": {name: [] for name in MEASURES}, "reranked": {name: [] for name in MEASURES}}
-    fell_back = comparisons = tokens = 0
+async def evaluate_with(
+    reranker: Reranker,
+    queries: list[dict],
+    out=sys.stdout,
+    per_query: bool = False,
+    ranker: str | None = None,
+    depth: int | None = None,
+) -> dict:
+    measures = MEASURES if depth is None else measures_at(depth)
+    tau = next(name for name in measures if name.startswith("tau-b"))
+    scores = {"search": {name: [] for name in measures}, "reranked": {name: [] for name in measures}}
+    fell_back = comparisons = tokens = llm_input = llm_output = 0
     seconds: list[float] = []
     for line in queries:
         texts = [document["text"] for document in line["documents"]]
         grades = [float(document["grade"]) for document in line["documents"]]
         started = time.perf_counter()
-        outcome = await reranker.rerank(line["query"], texts)
+        outcome = await reranker.rerank(line["query"], texts, ranker=ranker)
         seconds.append(time.perf_counter() - started)
         fell_back += not outcome.reranked
         comparisons += outcome.asked
         tokens += outcome.input_tokens
+        llm_input += outcome.stats.get("llm_input_tokens", 0)
+        llm_output += outcome.stats.get("llm_output_tokens", 0)
         reranked_grades = [grades[ranked.index] for ranked in outcome.results]
-        for name, measure in MEASURES.items():
+        for name, measure in measures.items():
             scores["search"][name].append(measure(grades))
             scores["reranked"][name].append(measure(reranked_grades))
         if per_query:
-            tau = (scores["search"]["tau-b"][-1], scores["reranked"]["tau-b"][-1])
+            taus = (scores["search"][tau][-1], scores["reranked"][tau][-1])
             print(
-                f"{line['query'][:40]:40} tau-b {_shown(tau[0]):>6} -> {_shown(tau[1]):>6}"
+                f"{line['query'][:40]:40} {tau} {_shown(taus[0]):>6} -> {_shown(taus[1]):>6}"
                 f"  {'' if outcome.reranked else 'FELL BACK: ' + str(outcome.reason)}",
                 file=out,
             )
@@ -91,9 +112,12 @@ async def evaluate_with(reranker: Reranker, queries: list[dict], out=sys.stdout,
     )
     if seconds:
         print(
-            f"Jev: {tokens} input tokens; per query {statistics.median(seconds):.1f}s median, {max(seconds):.1f}s max",
+            f"Jev: {tokens} input tokens; per query {statistics.median(seconds):.2f}s median, "
+            f"{percentile(seconds, 0.9):.2f}s p90, {max(seconds):.2f}s max",
             file=out,
         )
+    if llm_input or llm_output:
+        print(f"Question LLM: {llm_input} input tokens, {llm_output} output tokens", file=out)
     return report(scores, out)
 
 
@@ -135,6 +159,12 @@ def _paired(search: list[float | None], reranked: list[float | None], resamples:
     return result
 
 
+def percentile(values: list[float], share: float) -> float:
+    """Nearest rank: the smallest value at least `share` of the values are not above."""
+    ordered = sorted(values)
+    return ordered[max(math.ceil(share * len(ordered)) - 1, 0)]
+
+
 def _mean(values: list[float | None]) -> float | None:
     defined = [value for value in values if value is not None]
     return statistics.fmean(defined) if defined else None
@@ -153,10 +183,20 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("judged", help="JSONL file of judged queries")
     parser.add_argument("--limit", type=int, help="only the first this many queries")
     parser.add_argument("--per-query", action="store_true", help="print each query's tau-b before and after")
+    parser.add_argument("--ranker", help="round-robin, blitz or decisions (default: RERANKER_RANKER)")
+    parser.add_argument("--depth", type=int, help="measure on the first this many hits (nDCG@depth of all)")
     arguments = parser.parse_args(argv)
     with open(arguments.judged, encoding="utf-8") as file:
         queries = [json.loads(line) for line in file if line.strip()]
-    asyncio.run(evaluate(queries[: arguments.limit], Settings(), per_query=arguments.per_query))
+    asyncio.run(
+        evaluate(
+            queries[: arguments.limit],
+            Settings(),
+            per_query=arguments.per_query,
+            ranker=arguments.ranker,
+            depth=arguments.depth,
+        )
+    )
 
 
 if __name__ == "__main__":

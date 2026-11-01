@@ -108,3 +108,32 @@ def test_another_judge_url_is_another_rubric():
     real = Settings(_env_file=None)
     assert rubric(real) != rubric(Settings(_env_file=None, jev_url="http://fake-jev:9000"))
     assert rubric(real) == rubric(Settings(_env_file=None))
+
+
+async def test_decisions_orders_hits_by_the_mean_p_yes_and_writes_the_questions_once_per_query(make_reranker, fake_jev):
+    reranker = make_reranker(fake_jev)
+    outcome = await reranker.rerank("angle bracket", DOCUMENTS, ranker="decisions")
+
+    assert outcome.reranked and outcome.ranker == "decisions"
+    assert [ranked.index for ranked in outcome.results] == [1, 2, 0, 3]
+    assert [round(ranked.score, 3) for ranked in outcome.results] == [1.0, 0.667, 0.333, 0.0]
+    # One LLM call, then one Jev request per hit carrying every (deduplicated) question.
+    llm, *jev = fake_jev.requests
+    assert llm["body"]["model"] == "gpt-5"
+    assert [len(request["body"]["questions"]) for request in jev] == [2, 2, 2, 2]
+    assert outcome.stats == {"llm_input_tokens": 50, "llm_output_tokens": 20, "questions_cached": False, "questions": 2}
+    assert outcome.input_tokens == 400
+
+    again = await reranker.rerank("angle bracket", DOCUMENTS, ranker="decisions")
+    assert again.stats["questions_cached"] and again.stats["llm_input_tokens"] == 0
+    assert len(fake_jev.requests) == 1 + 4 + 4
+
+
+async def test_decisions_falls_back_to_the_search_order_when_the_question_llm_fails(make_reranker):
+    def llm_down(request):
+        return httpx.Response(500, text="down")
+
+    outcome = await make_reranker(llm_down).rerank("q", DOCUMENTS, ranker="decisions")
+
+    assert not outcome.reranked
+    assert "question LLM answered 500" in outcome.reason

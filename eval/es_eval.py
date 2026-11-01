@@ -25,14 +25,13 @@ It costs what the cold comparisons cost: one Jev request per pair of each query'
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
 
 import httpx
 
-from eval.evaluate import MEASURES, measures_at, report
+from eval.evaluate import MEASURES, measures_at, percentile, report
 from eval.wands import SEARCH_FIELDS
 
 # BM25's weight next to the reranker's: below the smallest gap between rerank scores, half a win out of n - 1
@@ -83,12 +82,6 @@ def timed_search(client: httpx.Client, index: str, body: dict) -> tuple[list[dic
     if response.status_code != 200:
         raise RuntimeError(f"search failed: {response.status_code} {response.text[:500]}")
     return response.json()["hits"]["hits"], seconds
-
-
-def percentile(values: list[float], share: float) -> float:
-    """Nearest rank: the smallest value at least `share` of the values are not above."""
-    ordered = sorted(values)
-    return ordered[max(math.ceil(share * len(ordered)) - 1, 0)]
 
 
 def delay_line(name: str, values: list[float]) -> str:

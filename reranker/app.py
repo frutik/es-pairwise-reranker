@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from reranker.cache import open_cache
 from reranker.config import Settings
 from reranker.jev import JevClient
+from reranker.questions import QuestionGenerator
 from reranker.service import RANKERS, Reranker, rubric
 
 
@@ -57,7 +58,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 tie_band=settings.tie_band,
                 max_document_chars=settings.max_document_chars,
             )
-            app.state.reranker = Reranker(jev, cache, settings)
+            app.state.reranker = Reranker(jev, cache, settings, QuestionGenerator(client, settings))
             yield
 
     app = FastAPI(title="Pairwise reranker", lifespan=lifespan)
@@ -104,6 +105,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             "beyond_window": outcome.beyond_window,
             "ranker": outcome.ranker,
             "rounds": outcome.rounds,
+            **outcome.stats,
         }
         return RerankResponse(results=results, meta=meta)
 

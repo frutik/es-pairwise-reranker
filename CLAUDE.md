@@ -71,11 +71,16 @@ Invariants that span modules:
   only for callers that send hits in that order (`rerank-eval`).
 - **Scores** are the share of the other hits beaten (0..1). They only sort hits within one query and cannot be
   compared across queries.
-- **Two rankers**, chosen by `RERANKER_RANKER` or the path `/v1/rerank/<ranker>`. `round-robin` (`ranking.py`) asks
+- **Three rankers**, chosen by `RERANKER_RANKER` or the path `/v1/rerank/<ranker>`. `round-robin` (`ranking.py`) asks
   every pair, one Jev request each, in the exact shape the Quepid experiments measured. `blitz` (`blitz.py`, BlitzRank
   ported from the authors' package) asks a group of `blitz_k` per round, every pair of the group in one request
   (`JevClient.compare_group`), until the top `blitz_top_m` are certain, and leaves the rest of the window unranked.
   Its answers use their own rubric (`blitz_rubric`), apart from round-robin's.
+  `decisions` (bag of decisions, `questions.py`) asks an OpenAI-compatible LLM (`RERANKER_QUESTIONS_*`) for the
+  query's yes/no questions, keeps them via `ComparisonCache.get_questions`/`put_questions` (keyed by
+  `questions_rubric`), then asks Jev every question about each hit in one `noul` request (`JevClient.decide`) and
+  scores the mean P(yes). Its scores are continuous, so the BM25 tie-break only reorders hits within 0.001. Per-hit
+  answers are not cached: a repeated query still costs one Jev request per hit.
 
 Tests: `tests/test_cache.py` runs each cache test against both stores (Redis via `fakeredis`). `tests/conftest.py`
 provides `FakeJev`, an `httpx.MockTransport` handler that acts as a perfect judge. A document whose text ends in a

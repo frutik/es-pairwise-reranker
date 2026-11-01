@@ -5,6 +5,7 @@ Two stores share one interface: MemoryCache, per process, and RedisCache, shared
 that is down or slow counts as a miss: the comparison is asked again and search still works."""
 
 import hashlib
+import json
 import logging
 from collections import OrderedDict
 from collections.abc import AsyncIterator
@@ -31,6 +32,16 @@ class ComparisonCache(Protocol):
 
     async def put(self, query: str, first: str, second: str, winner: Winner, rubric: str | None = None) -> None: ...
 
+    async def get_questions(self, rubric: str, query: str) -> list[str] | None:
+        """A query's bag-of-decisions questions, or None when they have not been written yet."""
+        ...
+
+    async def put_questions(self, rubric: str, query: str, questions: list[str]) -> None: ...
+
+
+def questions_key(rubric: str, query: str) -> str:
+    return hashlib.sha256("\u0000".join(["questions", rubric, query]).encode()).hexdigest()
+
 
 def entry_key(rubric: str, query: str, first: str, second: str) -> tuple[str, bool]:
     """The key of a comparison, and whether the pair is stored the other way round."""
@@ -51,6 +62,14 @@ class MemoryCache:
         self._size = size
         self._rubric = rubric
         self._entries: OrderedDict[str, Winner] = OrderedDict()
+        # shortcut: never evicted (one small list per distinct query); bound it if one process serves unbounded queries
+        self._questions: dict[str, list[str]] = {}
+
+    async def get_questions(self, rubric: str, query: str) -> list[str] | None:
+        return self._questions.get(questions_key(rubric, query))
+
+    async def put_questions(self, rubric: str, query: str, questions: list[str]) -> None:
+        self._questions[questions_key(rubric, query)] = questions
 
     async def get_many(self, query: str, pairs: list[Pair], rubric: str | None = None) -> list[Winner | None]:
         return [self._get(rubric or self._rubric, query, first, second) for first, second in pairs]
@@ -104,6 +123,26 @@ class RedisCache:
             await self._client.set(self.KEY_PREFIX + key, _as_stored(winner, flipped).value, ex=self._ttl)
         except (redis.RedisError, OSError) as error:
             log.warning("could not keep a comparison in the cache: %s", error)
+
+    QUESTIONS_PREFIX = "reranker:questions:"
+
+    async def get_questions(self, rubric: str, query: str) -> list[str] | None:
+        try:
+            value = await self._client.get(self.QUESTIONS_PREFIX + questions_key(rubric, query))
+            return json.loads(value)["questions"] if value is not None else None
+        except (redis.RedisError, OSError) as error:
+            log.warning("question store unavailable, writing them again: %s", error)
+        except (ValueError, KeyError, TypeError):
+            pass
+        return None
+
+    async def put_questions(self, rubric: str, query: str, questions: list[str]) -> None:
+        # The query is stored too, so the store can be read as a table of queries and their questions.
+        value = json.dumps({"query": query, "questions": questions})
+        try:
+            await self._client.set(self.QUESTIONS_PREFIX + questions_key(rubric, query), value, ex=self._ttl)
+        except (redis.RedisError, OSError) as error:
+            log.warning("could not keep the questions: %s", error)
 
     @staticmethod
     def _read(value: bytes | str | None, flipped: bool) -> Winner | None:

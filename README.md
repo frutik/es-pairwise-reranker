@@ -27,6 +27,9 @@ cheaper or better, roughly in order of promise. Each one has to be measured agai
 - **BlitzRank: done, and it works** (see [BlitzRank: a window of 30](#blitzrank-a-window-of-30)). On a window of
   30 it gives round-robin's quality with about 4× less delay and 8× fewer tokens. `RERANKER_RANKER=blitz`, or call
   `/v1/rerank/blitz`.
+- **Bag of decisions: done** (see [Bag of decisions: a window of 30](#bag-of-decisions-a-window-of-30)). 0.013
+  below round-robin in nDCG@10, with the fewest Jev tokens and +410 ms once a query's questions are kept, but a new
+  query waits for the LLM. `RERANKER_RANKER=decisions`, or call `/v1/rerank/decisions`.
 - **Comparison sort**: a sort that uses the judge as its comparator needs about `n log n` comparisons, not `n²/2`.
   Quepid has one to port (`app/services/pair_ranking/comparison_sort.rb`). Round-robin copes with a judge that
   contradicts itself (82 cycles in 991 comparisons in the experiments); a sort does not, so check how much accuracy
@@ -251,6 +254,80 @@ docker compose --profile wands run --rm wands
 .venv/bin/wands-judged judged-wands-all.jsonl
 docker compose exec redis redis-cli FLUSHDB
 .venv/bin/es-eval judged-wands-all.jsonl --per-query
+```
+
+### Bag of decisions: a window of 30
+
+**Almost round-robin's quality, the cheapest in Jev tokens, but a new query waits for an LLM.** The same 204
+queries, window 30 and top 10, ranked with [bag of decisions](https://softwaredoug.com/blog/2026/10/08/bag-of-decisions)
+(Doug Turnbull, October 2026).
+
+**How it runs here** (`reranker/questions.py`, `JevClient.decide`):
+- **Questions:** an LLM writes the query's own yes/no questions, a "yes" meaning relevant. The prompts are the
+  article's ([search-experiments](https://github.com/softwaredoug/search-experiments),
+  `configs/ecom_decisions/bag_of_decisions.yml`) and so is the model, GPT-5. Any OpenAI-compatible API works
+  (`RERANKER_QUESTIONS_URL`, `_API_KEY`, `_MODEL`, `_REASONING_EFFORT`). GPT-5 wrote 7 to 20 a query, 12.6 on average.
+- **They are kept** in Redis (`reranker:questions:<hash>`, the query and its questions as JSON), keyed by the
+  query, the LLM and its prompt, so each query pays for the LLM once.
+- **Scoring:** one Jev request per hit carries all the questions as `noul` (yes/no) questions, with the hit's text
+  as the state. The score is the mean P(yes). The article adds 10× the sum to BM25; the mean orders the same and
+  stays in 0..1, so the usual BM25 tie-break applies. Its scores rarely tie, so the 0.001 tie-break can only swap hits
+  closer than that.
+- **Not cached:** the per-hit answers. A repeated query costs the same Jev requests again.
+
+**Agreement with the human labels** (in-process; the GPT-5 default run through Elasticsearch gave the same 0.908):
+
+| Measure (top 10) | BM25 | Round-robin | BlitzRank | Decisions, GPT-5 | Decisions, GPT-5 minimal reasoning |
+| --- | --- | --- | --- | --- | --- |
+| nDCG@10 | 0.808 | 0.921 | 0.919 | **0.908** | 0.900 |
+| tau-b@10 | 0.173 | 0.323 | 0.322 | 0.305 | 0.287 |
+| Pairwise accuracy@10 | 0.651 | 0.778 | 0.772 | 0.764 | 0.752 |
+
+Against BM25, decisions with GPT-5 gains +0.101 nDCG@10 (+0.076 to +0.126; 121 queries better, 52 the same, 31
+worse). That is about 0.013 below round-robin. The per-query round-robin scores were not saved, so this gap has no
+paired interval. Minimal reasoning writes fewer questions (9.7 a query on average, against 12.6) and loses another 0.008.
+
+**Delay a new query waits:**
+
+| | p50 | p90 | max |
+| --- | --- | --- | --- |
+| Decisions, GPT-5: questions + Jev (in-process) | 17.5 s | 25.1 s | 34.9 s |
+| Decisions, GPT-5 minimal reasoning: questions + Jev (in-process) | 2.5 s | 3.1 s | 18.8 s |
+| **Decisions, questions already kept: added through Elasticsearch** | **+410 ms** | +467 ms | +759 ms |
+| Round-robin, added through Elasticsearch | +4,898 ms | +5,029 ms | +5,206 ms |
+| BlitzRank, added through Elasticsearch | +1,133 ms | +1,296 ms | +1,697 ms |
+
+Once a query's questions are kept, scoring is 30 Jev requests at once (2 rounds at 16 in flight), and the delay is
+the lowest of the three rankers. A repeated query waits the same +408 ms, since the per-hit answers are not cached,
+while round-robin and BlitzRank drop to about +53 ms. A query never asked before waits for the LLM first. GPT-5 with
+its default reasoning wrote about 2,200 output tokens per query and took 17 s, which is too long for live search.
+
+**Cost per new query** (204 queries, in-process):
+
+| | Jev requests | Jev input tokens | LLM tokens (in / out) |
+| --- | --- | --- | --- |
+| Round-robin | 435 | about 272,000 | – |
+| BlitzRank | 5 | about 33,000 | – |
+| **Decisions, GPT-5** | 30 | **about 21,700** | 102 / 2,180 |
+| Decisions, GPT-5 minimal reasoning | 30 | about 18,900 | 102 / 220 |
+
+A repeated query costs the 30 Jev requests again but no LLM call. At GPT-5's list price ($1.25 in, $10 out per
+million tokens), the questions cost about 2.2 cents per query, or 0.2 cents with minimal reasoning.
+
+**What it is good for:** live search for queries whose questions are already kept. Write them in advance for
+frequent queries, or write them on the first search with a faster LLM. A cache of per-hit answers would bring a
+repeated query down to round-robin's +53 ms.
+
+To try it, set `RERANKER_QUESTIONS_API_KEY` and register an endpoint on `/v1/rerank/decisions`. Pass the window
+settings to every compose command, or `run setup` recreates the reranker with the defaults (window 20):
+
+```sh
+export RERANKER_MAX_DOCUMENTS=30 RERANKER_TIME_BUDGET_SECONDS=60
+docker compose up -d --build reranker
+docker compose run --rm --no-deps -e RERANKER_URL=http://reranker:8000/v1/rerank/decisions \
+  -e INFERENCE_ID=pairwise-decisions setup
+.venv/bin/rerank-eval judged-wands-30.jsonl --ranker decisions --depth 10      # quality, tokens, cold time
+.venv/bin/es-eval judged-wands-30.jsonl --window 30 --depth 10 --inference-id pairwise-decisions
 ```
 
 ## How it works

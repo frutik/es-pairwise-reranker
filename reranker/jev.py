@@ -150,6 +150,27 @@ class JevClient:
                 winners[(i, j)] = Winner.FIRST if chosen == labels[i] else Winner.SECOND
         return winners, _integer((body.get("usage") or {}).get("input_tokens")) or 0
 
+    def decide_request_body(self, text: str, questions: list[str]) -> dict:
+        """Bag of decisions: every yes/no question about one document, in one request. The state is the document alone,
+        as in the article; the questions carry the query."""
+        return {
+            "model": self._model,
+            "state": self._cut(text),
+            "questions": {f"q{n}": {"type": "noul", "instructions": q} for n, q in enumerate(questions)},
+        }
+
+    async def decide(self, text: str, questions: list[str]) -> tuple[float, int]:
+        """The sum of P(yes) over the questions, and Jev's input tokens."""
+        body = await self._post(self.decide_request_body(text, questions))
+        answers = body.get("answers") or {}
+        total = 0.0
+        for n in range(len(questions)):
+            probability = _number((answers.get(f"q{n}") or {}).get("noul"))
+            if probability is None or not 0 <= probability <= 1:
+                raise JevError(f"Jev gave no readable noul for q{n}: {body!r:.300}")
+            total += probability
+        return total, _integer((body.get("usage") or {}).get("input_tokens")) or 0
+
     async def _post(self, request: dict) -> dict:
         try:
             response = await self._client.post(
